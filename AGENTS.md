@@ -23,8 +23,13 @@ Backend (run from `backend/`):
 mvn spring-boot:run -Dspring-boot.run.profiles=dev   # http://localhost:8080, schema in collabdoc_dev
 mvn spring-boot:run                                  # default profile, schema in collabdoc
 mvn -o -DskipTests package
-mvn test                                             # 31 tests on in-memory H2, no MySQL needed
+mvn test                                             # 36 tests on in-memory H2, no MySQL needed
 ```
+
+`CollabInvariantTest` and `DocumentSequencerTest` are the ones that encode *why* the design is correct (see
+the I1–I6 list in the plan doc): uniqueness/monotonicity of the sequence, gapless replay, no self-echo, and
+no fan-out for a rolled-back write. `rolledBackWriteFansOutNothing` is paired with
+`committedWriteFansOutExactlyOnce` on purpose, so the former cannot pass because nothing ever publishes.
 
 `mvn test` uses `src/test/resources/application-test.yml` (H2 in MySQL mode, `create-drop`). First run
 needs network for the surefire provider and the pinned `h2:2.3.232`; after that `-o` works. Two H2 quirks
