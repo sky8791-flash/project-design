@@ -1,56 +1,62 @@
 <template>
   <div id="app">
-    <div v-if="!currentUser" class="login-container">
+    <div v-if="!user" class="login-container">
       <LoginView @login="handleLogin" />
     </div>
-    <div v-else-if="adminMode" class="home-container">
-      <AdminView :user="currentUser" @back="adminMode = false" />
-    </div>
-    <div v-else-if="!currentDocument" class="home-container">
-      <HomeView :user="currentUser" @open-document="openDocument" @create-document="createDocument" @logout="handleLogout" @go-admin="adminMode = true" />
-    </div>
-    <div v-else class="editor-container">
-      <DocumentView :user="currentUser" :document-id="currentDocument" @back="currentDocument = null" />
-    </div>
+    <template v-else>
+      <NotificationBell :user="user" />
+      <div v-if="isDocument" class="editor-container">
+        <!-- keyed by route: one document session owns one socket, one collab client and one clientId -->
+        <router-view
+          :key="$route.fullPath"
+          :user="user"
+          @back="goHome"
+          @logout="handleLogout"
+          @go-admin="goAdmin"
+        />
+      </div>
+      <div v-else class="home-container">
+        <router-view
+          :key="$route.fullPath"
+          :user="user"
+          @open-document="openDocument"
+          @create-document="createDocument"
+          @logout="handleLogout"
+          @go-admin="goAdmin"
+          @back="goHome"
+        />
+      </div>
+    </template>
   </div>
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import LoginView from './views/LoginView.vue'
-import HomeView from './views/HomeView.vue'
-import DocumentView from './views/DocumentView.vue'
-import AdminView from './views/AdminView.vue'
-import api from './services/api'
+import NotificationBell from './components/NotificationBell.vue'
+import session from './services/session'
 
-const stored = localStorage.getItem('user')
-const currentUser = ref(stored ? JSON.parse(stored) : null)
-const currentDocument = ref(null)
-const adminMode = ref(false)
+const user = computed(() => session.currentUser.value)
 
-const handleLogin = (user) => {
-  currentUser.value = user
-  localStorage.setItem('user', JSON.stringify(user))
-}
+const route = useRoute()
+const router = useRouter()
+const isDocument = computed(() => route.name === 'document')
+
+const handleLogin = (signedIn) => session.signIn(signedIn)
 
 const handleLogout = () => {
-  currentUser.value = null
-  currentDocument.value = null
-  adminMode.value = false
-  localStorage.removeItem('user')
+  session.signOut()
+  router.replace({ name: 'home' })
 }
 
-const openDocument = (docId) => {
-  currentDocument.value = docId
-}
+const goHome = () => router.push({ name: 'home' })
+const goAdmin = () => router.push({ name: 'admin' })
+const openDocument = (docId) => router.push({ name: 'document', params: { id: String(docId) } })
 
 const createDocument = async (title) => {
   try {
-    const response = await api.post('/api/documents', {
-      title: title,
-      userId: String(currentUser.value.id)
-    })
-    currentDocument.value = String(response.data.id)
+    openDocument(await session.createDocument(title))
   } catch (error) {
     console.error('Failed to create document:', error)
     alert('创建文档失败，请重试')

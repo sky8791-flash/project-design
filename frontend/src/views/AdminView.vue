@@ -99,10 +99,7 @@ const loadUsers = async () => {
     if (keyword.value.trim()) {
       params.keyword = keyword.value.trim()
     }
-    const response = await api.get('/api/admin/users', {
-      params,
-      headers: { 'X-User-Id': String(currentUserId.value) }
-    })
+    const response = await api.get('/api/admin/users', { params })
     users.value = response.data.content
     totalPages.value = response.data.totalPages
     totalElements.value = response.data.totalElements
@@ -131,9 +128,7 @@ const toggleRole = async (user) => {
   const newRole = user.role === 'ADMIN' ? 'USER' : 'ADMIN'
   if (!confirm(`确定将 ${user.username} 的角色改为 ${newRole === 'ADMIN' ? '管理员' : '普通用户'} 吗？`)) return
   try {
-    await api.put(`/api/admin/users/${user.id}/role`, { role: newRole }, {
-      headers: { 'X-User-Id': String(currentUserId.value) }
-    })
+    await api.put(`/api/admin/users/${user.id}/role`, { role: newRole })
     await loadUsers()
   } catch (error) {
     alert('操作失败: ' + (error.response?.data?.error || error.message))
@@ -144,9 +139,7 @@ const toggleEnabled = async (user) => {
   const newEnabled = !user.enabled
   if (!confirm(`确定${newEnabled ? '启用' : '禁用'}用户 ${user.username} 吗？`)) return
   try {
-    await api.put(`/api/admin/users/${user.id}/enabled`, { enabled: newEnabled }, {
-      headers: { 'X-User-Id': String(currentUserId.value) }
-    })
+    await api.put(`/api/admin/users/${user.id}/enabled`, { enabled: newEnabled })
     await loadUsers()
   } catch (error) {
     alert('操作失败: ' + (error.response?.data?.error || error.message))
@@ -156,9 +149,7 @@ const toggleEnabled = async (user) => {
 const resetPassword = async (user) => {
   if (!confirm(`确定重置 ${user.username} 的密码吗？`)) return
   try {
-    const response = await api.put(`/api/admin/users/${user.id}/password`, {}, {
-      headers: { 'X-User-Id': String(currentUserId.value) }
-    })
+    const response = await api.put(`/api/admin/users/${user.id}/password`, {})
     newPassword.value = response.data.newPassword
   } catch (error) {
     alert('操作失败: ' + (error.response?.data?.error || error.message))
@@ -168,9 +159,7 @@ const resetPassword = async (user) => {
 const deleteUser = async (user) => {
   if (!confirm(`确定删除用户 ${user.username} 吗？此操作不可恢复！`)) return
   try {
-    await api.delete(`/api/admin/users/${user.id}`, {
-      headers: { 'X-User-Id': String(currentUserId.value) }
-    })
+    await api.delete(`/api/admin/users/${user.id}`)
     await loadUsers()
   } catch (error) {
     alert('删除失败: ' + (error.response?.data?.error || error.message))

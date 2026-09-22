@@ -1,26 +1,26 @@
 <template>
   <div class="doc-editor">
-    <div v-if="editor" class="editor-container">
+    <div v-if="editor && !loadError && !loading" class="editor-container">
       <div class="toolbar">
         <div class="toolbar-group">
-          <button @click="handleUndo" :disabled="!canUndo" class="toolbar-btn" title="撤销">
+          <button @click="handleUndo" :disabled="!canUndo || readOnly" class="toolbar-btn" title="撤销">
             <span>撤销</span>
           </button>
-          <button @click="handleRedo" :disabled="!canRedo" class="toolbar-btn" title="重做">
+          <button @click="handleRedo" :disabled="!canRedo || readOnly" class="toolbar-btn" title="重做">
             <span>重做</span>
           </button>
         </div>
         <div class="toolbar-group">
-          <button @click="toggleBold" :class="{ active: editor.isActive('bold') }" class="toolbar-btn" title="粗体">
+          <button @click="toggleBold" :disabled="readOnly" :class="{ active: editor.isActive('bold') }" class="toolbar-btn" title="粗体">
             <strong>B</strong>
           </button>
-          <button @click="toggleItalic" :class="{ active: editor.isActive('italic') }" class="toolbar-btn" title="斜体">
+          <button @click="toggleItalic" :disabled="readOnly" :class="{ active: editor.isActive('italic') }" class="toolbar-btn" title="斜体">
             <em>I</em>
           </button>
-          <button @click="toggleStrike" :class="{ active: editor.isActive('strike') }" class="toolbar-btn" title="删除线">
+          <button @click="toggleStrike" :disabled="readOnly" :class="{ active: editor.isActive('strike') }" class="toolbar-btn" title="删除线">
             <s>S</s>
           </button>
-          <button @click="toggleCode" :class="{ active: editor.isActive('code') }" class="toolbar-btn" title="代码">
+          <button @click="toggleCode" :disabled="readOnly" :class="{ active: editor.isActive('code') }" class="toolbar-btn" title="代码">
             <code>C</code>
           </button>
         </div>
@@ -35,11 +35,16 @@
           </button>
         </div>
         <div class="toolbar-group">
-          <button @click="downloadAsDocx" class="toolbar-btn">
+          <button @click="downloadAsDocx" :disabled="readOnly" class="toolbar-btn">
             下载
           </button>
         </div>
+        <div class="toolbar-group toolbar-status">
+          <span v-if="statusError" class="offline">{{ statusError }}</span>
+          <span v-else :class="{ offline: !connected }">{{ connectionLabel }}</span>
+        </div>
       </div>
+      <div v-if="readOnly" class="readonly-hint">只读分享：你可以查看，但不能编辑</div>
       <div class="editor-content">
         <div class="collaborators-bar">
           <div v-for="cursor in collaborators" :key="cursor.userId" 
@@ -60,15 +65,15 @@
           <div v-if="operationHistory.length === 0" class="empty-history">
             暂无操作记录
           </div>
-          <div v-for="(log, index) in operationHistory" :key="log.id" class="history-item">
+          <div v-for="(log, index) in operationHistory" :key="log.version" class="history-item">
             <div class="history-info">
               <span class="history-type">{{ log.commandType }}</span>
               <span class="history-user">{{ log.username || '用户' + log.userId }}</span>
               <span class="history-version">v{{ log.version }}</span>
             </div>
-            <div class="history-params">{{ log.commandParams }}</div>
+            <div class="history-params">{{ summarizeParams(log) }}</div>
             <div class="history-time">{{ formatTime(log.createdAt) }}</div>
-            <button @click="restoreVersion(log.version)" class="restore-btn">恢复</button>
+            <button v-if="log.snapshotAvailable" @click="restoreVersion(log.version)" class="restore-btn">恢复</button>
           </div>
         </div>
       </div>
@@ -88,7 +93,7 @@
           </div>
           <div class="share-list">
             <h4>已分享用户</h4>
-            <div v-for="share in documentShares" :key="share.id" class="share-item">
+            <div v-for="share in documentShares" :key="share.shareId" class="share-item">
               <span>{{ share.username }}</span>
               <span class="share-permission">{{ share.permission === 'READ_WRITE' ? '可编辑' : '只读' }}</span>
               <button @click="removeShare(share.userId)" class="remove-share-btn">×</button>
@@ -98,10 +103,10 @@
         </div>
       </div>
     </div>
-    <div v-if="loadError" class="loading">
+    <div v-else-if="loadError" class="loading">
       <div class="error-state">
-        <p>加载文档失败</p>
-        <button @click="loadDocument" class="retry-btn">重试</button>
+        <p>无法打开文档：可能没有访问权限，或文档已被删除</p>
+        <button @click="startSession" class="retry-btn">重试</button>
       </div>
     </div>
     <div v-else class="loading">加载中...</div>
@@ -109,20 +114,25 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { useEditor, EditorContent } from '@tiptap/vue-3'
+import { Extension } from '@tiptap/core'
 import StarterKit from '@tiptap/starter-kit'
 import api from '../services/api'
 import wsService from '../services/websocket'
+import notifications from '../services/notifications'
+import { createCollabClient, makeClientId } from '../collab/otClient'
+import { createCursorLayer, refreshCursors } from '../collab/cursorLayer'
 
 const props = defineProps({
   documentId: String,
   user: Object
 })
 
-const emit = defineEmits(['update-version', 'update-online'])
+const emit = defineEmits(['update-online', 'update-title'])
 
-const isRemoteUpdate = ref(false)
+const clientId = makeClientId()
+const collab = ref(null)
 const currentVersion = ref(0)
 const showHistory = ref(false)
 const operationHistory = ref([])
@@ -137,21 +147,32 @@ const shareMessage = ref('')
 const shareSuccess = ref(false)
 const documentShares = ref([])
 const loadError = ref(false)
+const loading = ref(true)
+const permission = ref(null)
+const connected = ref(false)
+const statusError = ref('')
 
-const cursorColors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
-const getRandomColor = (userId) => {
-  const num = parseInt(userId)
-  const index = (isNaN(num) ? 0 : num) % cursorColors.length
-  return cursorColors[index]
-}
+const readOnly = computed(() => permission.value === 'READ_ONLY')
+const connectionLabel = computed(() =>
+  connected.value ? `已连接 · v${currentVersion.value}` : '连接已断开，正在重连')
+
+const CursorLayer = Extension.create({
+  name: 'remoteCursors',
+  addProseMirrorPlugins() {
+    return [createCursorLayer(() => collaborators.value)]
+  }
+})
 
 const editor = useEditor({
-  extensions: [StarterKit],
+  extensions: [StarterKit, CursorLayer],
   content: '',
   editorProps: {
     handleKeyDown(view, event) {
       if (event.key === 'Tab') {
         event.preventDefault()
+        // A read-only editor ignores dispatch by state, not by policy: sending the step anyway gets
+        // the socket closed by the server with 4001.
+        if (!view.editable) return true
         const { from, to } = view.state.selection
         const tr = view.state.tr.insertText('\t', from, to)
         view.dispatch(tr)
@@ -160,92 +181,44 @@ const editor = useEditor({
       return false
     }
   },
-  onUpdate: ({ editor }) => {
-    if (isRemoteUpdate.value) return
-    const { from } = editor.state.selection
-    sendCursorPosition(from)
-    debouncedSave(editor.getHTML())
+  onUpdate: ({ editor, transaction }) => {
+    if (transaction.getMeta('remote')) return
+    if (transaction.steps.length) collab.value?.addLocalSteps([...transaction.steps])
+    refreshHistoryFlags(editor)
+    sendCursorPosition(editor.state.selection.from)
   },
   onSelectionUpdate: ({ editor }) => {
-    const { from } = editor.state.selection
-    sendCursorPosition(from)
+    sendCursorPosition(editor.state.selection.from)
   }
 })
 
-const saveDocument = async (content) => {
-  try {
-    const response = await api.put(`/api/documents/${props.documentId}`, {
-      content: content,
-      version: currentVersion.value,
-      userId: props.user.id
-    })
-    if (response.data && response.data.version !== undefined) {
-      currentVersion.value = response.data.version
-      emit('update-version', response.data.version)
-    }
-  } catch (error) {
-    console.error('Failed to save document:', error)
-  }
-}
-
-let saveTimeout = null
-const debouncedSave = (content) => {
-  if (saveTimeout) clearTimeout(saveTimeout)
-  saveTimeout = setTimeout(() => saveDocument(content), 1000)
-}
-
-const sendCursorPosition = (position) => {
-  wsService.send({
-    type: 'CURSOR',
-    documentId: props.documentId,
-    userId: props.user.id,
-    position: position
+const refreshHistoryFlags = (instance) => {
+  nextTick(() => {
+    canUndo.value = instance.can().undo()
+    canRedo.value = instance.can().redo()
   })
 }
 
-const handleUndo = async () => {
-  try {
-    const response = await api.post(`/api/documents/${props.documentId}/undo?userId=${props.user.id}`)
-    if (response.data.error) {
-      console.log('Undo:', response.data.error)
-      return
-    }
-    const state = response.data
-    isRemoteUpdate.value = true
-    if (editor.value && state.content !== undefined) {
-      editor.value.commands.setContent(state.content)
-    }
-    currentVersion.value = state.version
-    emit('update-version', state.version)
-    canUndo.value = state.version > 0
-    canRedo.value = true
-    isRemoteUpdate.value = false
-  } catch (error) {
-    console.error('Undo failed:', error)
-  }
+let cursorTimer = null
+const sendCursorPosition = (position) => {
+  if (cursorTimer) return
+  cursorTimer = setTimeout(() => {
+    cursorTimer = null
+    if (editor.value) wsService.send({
+      type: 'CURSOR',
+      position: editor.value.state.selection.from
+    })
+  }, 80)
 }
 
-const handleRedo = async () => {
-  try {
-    const response = await api.post(`/api/documents/${props.documentId}/redo?userId=${props.user.id}`)
-    if (response.data.error) {
-      console.log('Redo:', response.data.error)
-      canRedo.value = false
-      return
-    }
-    const state = response.data
-    isRemoteUpdate.value = true
-    if (editor.value && state.content !== undefined) {
-      editor.value.commands.setContent(state.content)
-    }
-    currentVersion.value = state.version
-    emit('update-version', state.version)
-    canUndo.value = true
-    isRemoteUpdate.value = false
-  } catch (error) {
-    console.error('Redo failed:', error)
-    canRedo.value = false
-  }
+const handleUndo = () => {
+  if (editor.value) editor.value.chain().focus().undo().run()
+  refreshHistoryFlags(editor.value)
+}
+
+const handleRedo = () => {
+  if (editor.value) editor.value.chain().focus().redo().run()
+  refreshHistoryFlags(editor.value)
 }
 
 const toggleBold = () => {
@@ -273,7 +246,7 @@ const toggleHistory = async () => {
 
 const loadOperationHistory = async () => {
   try {
-    const response = await api.get(`/api/documents/${props.documentId}/history?userId=${props.user.id}`)
+    const response = await api.get(`/api/documents/${props.documentId}/history`)
     operationHistory.value = response.data
   } catch (error) {
     console.error('Failed to load operation history:', error)
@@ -282,22 +255,23 @@ const loadOperationHistory = async () => {
 
 const restoreVersion = async (version) => {
   try {
-    const response = await api.post(`/api/documents/${props.documentId}/restore/${version}?userId=${props.user.id}`)
-    if (response.data.error) {
-      console.error('Restore failed:', response.data.error)
-      return
-    }
-    const state = response.data
-    isRemoteUpdate.value = true
-    if (editor.value && state.content !== undefined) {
-      editor.value.commands.setContent(state.content)
-    }
-    currentVersion.value = state.version
-    emit('update-version', state.version)
-    isRemoteUpdate.value = false
+    await api.post(`/api/documents/${props.documentId}/restore/${version}`)
+    // The server answers every session with RESET, which the collab client applies.
     showHistory.value = false
   } catch (error) {
     console.error('Restore failed:', error)
+    statusError.value = error.response?.data?.error || '恢复失败'
+  }
+}
+
+const summarizeParams = (log) => {
+  if (!log.commandParams) return ''
+  if (log.commandType !== 'STEPS') return log.commandParams
+  try {
+    const parsed = JSON.parse(log.commandParams)
+    return `${(parsed.steps || []).length} 处修改`
+  } catch {
+    return log.commandParams
   }
 }
 
@@ -343,7 +317,6 @@ const handleShare = async () => {
     
     const response = await api.post(`/api/documents/${props.documentId}/share`, {
       userId: targetUserId,
-      sharedByUserId: props.user.id,
       permission: sharePermission.value
     })
     if (response.data.error) {
@@ -363,7 +336,7 @@ const handleShare = async () => {
 
 const removeShare = async (userId) => {
   try {
-    await api.delete(`/api/documents/${props.documentId}/share/${userId}?requestUserId=${props.user.id}`)
+    await api.delete(`/api/documents/${props.documentId}/share/${userId}`)
     await loadDocumentShares()
   } catch (error) {
     console.error('Failed to remove share:', error)
@@ -379,101 +352,145 @@ const loadDocumentShares = async () => {
   }
 }
 
+const cursorColors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
+const getRandomColor = (userId) => {
+  const num = parseInt(userId)
+  const index = (isNaN(num) ? 0 : num) % cursorColors.length
+  return cursorColors[index]
+}
+
+const repaintCursors = () => {
+  if (editor.value?.view) refreshCursors(editor.value.view)
+}
+
+const trackCollaborator = (message) => {
+  const { userId, username, position } = message
+  const existing = collaborators.value.find((c) => c.userId === userId)
+  if (existing) {
+    if (position !== undefined) existing.position = position
+    if (username) existing.username = username
+  } else {
+    collaborators.value.push({
+      userId,
+      username: username || `用户${userId}`,
+      position,
+      color: getRandomColor(userId)
+    })
+  }
+  repaintCursors()
+
+  if (position === undefined) return
+  clearTimeout(cursorTimeouts.get(userId))
+  // A caret that has not moved for a while is not worth showing; the user stays in the online count.
+  cursorTimeouts.set(userId, setTimeout(() => {
+    collaborators.value = collaborators.value.filter((c) => c.userId !== userId)
+    cursorTimeouts.delete(userId)
+    repaintCursors()
+  }, 30000))
+}
+
+const dropCollaborator = (userId) => {
+  clearTimeout(cursorTimeouts.get(userId))
+  cursorTimeouts.delete(userId)
+  collaborators.value = collaborators.value.filter((c) => c.userId !== userId)
+  repaintCursors()
+}
+
+let unsubscribers = []
+
 const connectWebSocket = async () => {
-  try {
-    await wsService.connect(props.documentId, String(props.user.id))
+  await wsService.connect(props.documentId)
+  connected.value = true
 
+  unsubscribers.push(
     wsService.on('INIT', (message) => {
-      isRemoteUpdate.value = true
-      if (editor.value && message.content) {
-        editor.value.commands.setContent(message.content)
-      }
-      currentVersion.value = message.version
-      emit('update-version', message.version)
+      permission.value = message.permission
+      emit('update-title', message.title)
+      editor.value.setEditable(message.permission !== 'READ_ONLY')
+      // Content is only valid up to checkpointVersion; bootstrap replays the operations above it.
+      collab.value.bootstrap(message).catch((error) => {
+        console.error('Failed to bootstrap document state:', error)
+        loadError.value = true
+      })
+    }),
+    wsService.on('STEPS', (message) => collab.value?.handleSteps(message)),
+    wsService.on('ACK', (message) => collab.value?.handleAck(message)),
+    wsService.on('REJECT', (message) => collab.value?.handleReject(message)),
+    wsService.on('RESET', (message) => collab.value?.handleReset(message)),
+    wsService.on('CURSOR_UPDATE', trackCollaborator),
+    wsService.on('USER_JOINED', (message) => {
+      trackCollaborator(message)
       emit('update-online', message.onlineCount)
-      canUndo.value = message.version > 0
-      isRemoteUpdate.value = false
-    })
-
-    wsService.on('CONTENT_UPDATE', (message) => {
-      if (saveTimeout) {
-        clearTimeout(saveTimeout)
-        saveTimeout = null
-      }
-      isRemoteUpdate.value = true
-      if (editor.value && message.content) {
-        editor.value.commands.setContent(message.content)
-      }
-      currentVersion.value = message.version
-      emit('update-version', message.version)
-      if (message.onlineCount !== undefined) {
-        emit('update-online', message.onlineCount)
-      }
-      canUndo.value = message.version > 0
-      isRemoteUpdate.value = false
-    })
-
-    wsService.on('CURSOR_UPDATE', (message) => {
-      const userId = message.userId
-      const position = message.position
-      
-      const existingIndex = collaborators.value.findIndex(c => c.userId === userId)
-      if (existingIndex >= 0) {
-        collaborators.value[existingIndex].position = position
-      } else {
-        collaborators.value.push({
-          userId: userId,
-          username: `用户${userId}`,
-          position: position,
-          color: getRandomColor(userId)
-        })
-      }
-      
-      if (cursorTimeouts.has(userId)) {
-        clearTimeout(cursorTimeouts.get(userId))
-      }
-      cursorTimeouts.set(userId, setTimeout(() => {
-        collaborators.value = collaborators.value.filter(c => c.userId !== userId)
-        cursorTimeouts.delete(userId)
-      }, 5000))
-    })
-
+    }),
     wsService.on('USER_LEFT', (message) => {
-      emit('update-online', message.onlineCount)
-    })
-  } catch (error) {
-    console.error('WebSocket connection failed:', error)
-  }
+      dropCollaborator(message.userId)
+      if (message.onlineCount !== undefined) emit('update-online', message.onlineCount)
+    }),
+    wsService.on('TITLE_UPDATE', (message) => emit('update-title', message.title)),
+    wsService.on('NOTIFICATION', (message) => notifications.push(message))
+  )
 }
 
-const loadDocument = async () => {
+const startSession = async () => {
   loadError.value = false
+  loading.value = true
+  // A retry must not stack a second set of handlers onto the same socket service.
+  unsubscribers.forEach((off) => off())
+  unsubscribers = []
+  if (!collab.value) {
+    collab.value = createCollabClient({
+      editor: editor.value,
+      documentId: props.documentId,
+      clientId,
+      api,
+      ws: wsService
+    })
+    collab.value.on('version', (value) => {
+      currentVersion.value = value
+    })
+    // A reset replaces the whole document, so the mapped caret positions it inherited are meaningless.
+    collab.value.on('reset', () => {
+      refreshHistoryFlags(editor.value)
+      repaintCursors()
+    })
+    collab.value.on('presence', (count) => emit('update-online', count))
+    collab.value.on('error', (error) => {
+      statusError.value = error?.message || '协同同步异常，请刷新页面'
+    })
+  }
+
   try {
-    const response = await api.get(`/api/documents/${props.documentId}?userId=${props.user.id}`)
-    currentVersion.value = response.data.version
-    emit('update-version', response.data.version)
-    if (editor.value && response.data.content) {
-      editor.value.commands.setContent(response.data.content)
-    }
-    canUndo.value = response.data.version > 0
+    await connectWebSocket()
+    await loadDocumentShares()
   } catch (error) {
-    console.error('Failed to load document:', error)
+    console.error('Collaboration session failed:', error)
     loadError.value = true
+  } finally {
+    loading.value = false
   }
 }
 
-onMounted(async () => {
-  await loadDocument()
-  await connectWebSocket()
-  await loadDocumentShares()
+const beforeUnload = () => {
+  if (collab.value && !readOnly.value) collab.value.requestCheckpoint()
+}
+
+onMounted(() => {
+  startSession()
+  window.addEventListener('beforeunload', beforeUnload)
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', beforeUnload)
+  unsubscribers.forEach((off) => off())
+  unsubscribers = []
+  collab.value?.destroy()
   wsService.disconnect()
   if (editor.value) {
     editor.value.destroy()
   }
-  if (saveTimeout) clearTimeout(saveTimeout)
+  cursorTimeouts.forEach((timer) => clearTimeout(timer))
+  cursorTimeouts.clear()
+  if (cursorTimer) clearTimeout(cursorTimer)
 })
 </script>
 
@@ -481,6 +498,25 @@ onBeforeUnmount(() => {
 .doc-editor {
   width: 100%;
   max-width: 800px;
+}
+
+.toolbar-status {
+  margin-left: auto;
+  align-items: center;
+  font-size: 12px;
+  color: #4caf78;
+}
+
+.toolbar-status .offline {
+  color: #d9534f;
+}
+
+.readonly-hint {
+  padding: 6px 16px;
+  background: #fff8e1;
+  color: #8a6d1a;
+  font-size: 13px;
+  border-bottom: 1px solid #f2e2b0;
 }
 
 .editor-container {

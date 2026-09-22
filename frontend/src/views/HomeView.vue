@@ -15,24 +15,32 @@
       <input v-model="newDocTitle" type="text" placeholder="新文档标题..." class="new-doc-input" />
       <button @click="handleCreate" class="create-btn">创建文档</button>
     </div>
+    <div class="search-row">
+      <input v-model="keyword" type="search" class="search-input" placeholder="搜索我的和共享给我的文档…" />
+      <span v-if="searching" class="search-hint">搜索中…</span>
+      <span v-else-if="keyword && !visibleDocuments.length" class="search-hint">没有匹配的文档</span>
+    </div>
     <div class="tabs">
       <button :class="{ active: activeTab === 'my' }" @click="activeTab = 'my'">我的文档</button>
       <button :class="{ active: activeTab === 'shared' }" @click="activeTab = 'shared'; loadSharedDocuments()">共享文档</button>
     </div>
     <div class="document-list">
       <div v-if="loading" class="empty">加载中...</div>
-      <div v-else-if="activeTab === 'my' && documents.length === 0" class="empty">暂无文档，点击上方按钮创建</div>
-      <div v-else-if="activeTab === 'shared' && sharedDocuments.length === 0" class="empty">暂无共享文档</div>
-      <div v-for="doc in (activeTab === 'my' ? documents : sharedDocuments)" :key="doc.id" class="document-item">
+      <div v-else-if="activeTab === 'my' && !keyword && !documents.length" class="empty">暂无文档，点击上方按钮创建</div>
+      <div v-else-if="activeTab === 'shared' && !keyword && !sharedDocuments.length" class="empty">暂无共享文档</div>
+      <div v-for="doc in visibleDocuments" :key="doc.id" class="document-item">
         <div class="doc-content" @click="$emit('open-document', String(doc.id))">
           <div class="doc-title">{{ doc.title }}</div>
           <div class="doc-meta">
             <span>版本: {{ doc.version }}</span>
             <span>更新: {{ formatDate(doc.updatedAt) }}</span>
-            <span v-if="activeTab === 'shared'" class="shared-badge">共享</span>
+            <span v-if="doc.permission && doc.permission !== 'OWNER'" class="shared-badge">
+              {{ doc.permission === 'READ_ONLY' ? '只读' : '可编辑' }}
+            </span>
+            <span v-if="doc.ownerName" class="owner-name">来自 {{ doc.ownerName }}</span>
           </div>
         </div>
-        <div v-if="activeTab === 'my'" class="doc-actions">
+        <div v-if="doc.permission === 'OWNER'" class="doc-actions">
           <button @click.stop="deleteDocument(doc.id)" class="delete-btn" title="删除文档">×</button>
         </div>
       </div>
@@ -40,8 +48,7 @@
   </div>
 </template>
 
-<script setup>
-import { ref, onMounted } from 'vue'
+<script setup>import { ref, computed, watch, onMounted } from 'vue'
 import api from '../services/api'
 
 const props = defineProps({
@@ -55,11 +62,42 @@ const sharedDocuments = ref([])
 const newDocTitle = ref('')
 const activeTab = ref('my')
 const loading = ref(true)
+const keyword = ref('')
+const searching = ref(false)
+const searchResults = ref([])
+
+const visibleDocuments = computed(() =>
+  keyword.value.trim() ? searchResults.value : (activeTab.value === 'my' ? documents.value : sharedDocuments.value))
+
+let searchTimer = null
+watch(keyword, (value) => {
+  clearTimeout(searchTimer)
+  const term = value.trim()
+  if (!term) {
+    searching.value = false
+    searchResults.value = []
+    return
+  }
+  searching.value = true
+  searchTimer = setTimeout(async () => {
+    try {
+      const { data } = await api.get('/api/documents/search', {
+        params: { keyword: term }
+      })
+      searchResults.value = data
+    } catch (error) {
+      console.error('Failed to search documents:', error)
+      searchResults.value = []
+    } finally {
+      searching.value = false
+    }
+  }, 250)
+})
 
 const loadDocuments = async () => {
   loading.value = true
   try {
-    const response = await api.get(`/api/documents/user/${props.user.id}`)
+    const response = await api.get('/api/documents/me')
     documents.value = response.data
   } catch (error) {
     console.error('Failed to load documents:', error)
@@ -70,7 +108,7 @@ const loadDocuments = async () => {
 
 const loadSharedDocuments = async () => {
   try {
-    const response = await api.get(`/api/documents/shared/${props.user.id}`)
+    const response = await api.get('/api/documents/shared')
     sharedDocuments.value = response.data
   } catch (error) {
     console.error('Failed to load shared documents:', error)
@@ -88,7 +126,7 @@ const deleteDocument = async (docId) => {
   if (!confirm('确定要删除这个文档吗？')) return
   
   try {
-    await api.delete(`/api/documents/${docId}?userId=${props.user.id}`)
+    await api.delete(`/api/documents/${docId}`)
     await loadDocuments()
   } catch (error) {
     console.error('Failed to delete document:', error)
@@ -171,6 +209,30 @@ onMounted(loadDocuments)
   display: flex;
   gap: 10px;
   margin-bottom: 20px;
+}
+
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.search-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 14px;
+}
+
+.search-hint {
+  font-size: 12px;
+  color: #999;
+}
+
+.owner-name {
+  color: #888;
 }
 
 .new-doc-input {
