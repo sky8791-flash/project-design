@@ -28,7 +28,8 @@ public class UserController {
             return ResponseEntity.ok(Map.of(
                 "id", user.getId(),
                 "username", user.getUsername(),
-                "userCode", user.getUserCode()
+                "userCode", user.getUserCode(),
+                "role", user.getRole().name()
             ));
         } catch (RuntimeException e) {
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
@@ -46,7 +47,8 @@ public class UserController {
             return ResponseEntity.ok(Map.of(
                 "id", user.getId(),
                 "username", user.getUsername(),
-                "userCode", user.getUserCode()
+                "userCode", user.getUserCode(),
+                "role", user.getRole().name()
             ));
         }
         return ResponseEntity.status(401).body(Map.of("error", "Invalid credentials"));
