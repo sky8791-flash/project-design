@@ -12,6 +12,7 @@ public class OperationLogDTO {
     private String commandParams;
     private Integer version;
     private LocalDateTime createdAt;
+    private boolean snapshotAvailable;
 
     public OperationLogDTO() {}
 
@@ -43,4 +44,6 @@ public class OperationLogDTO {
     public void setVersion(Integer version) { this.version = version; }
     public LocalDateTime getCreatedAt() { return createdAt; }
     public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
+    public boolean isSnapshotAvailable() { return snapshotAvailable; }
+    public void setSnapshotAvailable(boolean snapshotAvailable) { this.snapshotAvailable = snapshotAvailable; }
 }

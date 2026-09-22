@@ -7,6 +7,9 @@ import java.time.LocalDateTime;
 @Table(name = "document")
 public class Document {
 
+    public static final String FORMAT_HTML = "html";
+    public static final String FORMAT_DOC_JSON = "doc-json";
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
@@ -17,8 +20,19 @@ public class Document {
     @Column(columnDefinition = "LONGTEXT", nullable = false)
     private String content;
 
+    @Column(name = "content_format", nullable = false, length = 20)
+    private String contentFormat = FORMAT_HTML;
+
+    /**
+     * Collaboration sequence. There is deliberately no setter: only the repository's compare-and-set
+     * statements mint a version, so no code path can rewind it.
+     */
     @Column(nullable = false)
     private Integer version = 0;
+
+    @Version
+    @Column(name = "revision", nullable = false)
+    private Long revision = 0L;
 
     @Column(name = "created_by", nullable = false, updatable = false)
     private Long createdBy;
@@ -54,8 +68,10 @@ public class Document {
     public void setTitle(String title) { this.title = title; }
     public String getContent() { return content; }
     public void setContent(String content) { this.content = content; }
+    public String getContentFormat() { return contentFormat; }
+    public void setContentFormat(String contentFormat) { this.contentFormat = contentFormat; }
     public Integer getVersion() { return version; }
-    public void setVersion(Integer version) { this.version = version; }
+    public Long getRevision() { return revision; }
     public Long getCreatedBy() { return createdBy; }
     public void setCreatedBy(Long createdBy) { this.createdBy = createdBy; }
     public LocalDateTime getCreatedAt() { return createdAt; }

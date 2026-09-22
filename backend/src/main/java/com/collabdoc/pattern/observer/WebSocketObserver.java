@@ -1,39 +1,44 @@
 package com.collabdoc.pattern.observer;
 
-import com.collabdoc.websocket.WebSocketSessionManager;
+import com.collabdoc.dto.ContentAppliedEvent;
+import com.collabdoc.websocket.CollabBus;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 
+/**
+ * Fans a committed document change out over the socket. Presence is measured here, at send time, from the
+ * session registry rather than from observer counts, and the registry spans nodes when the bus does.
+ */
 public class WebSocketObserver implements DocumentObserver {
 
-    private final WebSocketSessionManager sessionManager;
-    private String userId;
-    private String documentId;
+    private final CollabBus bus;
+    private final String documentId;
 
-    public WebSocketObserver(WebSocketSessionManager sessionManager) {
-        this.sessionManager = sessionManager;
-    }
-
-    public void init(String userId, String documentId) {
-        this.userId = userId;
+    public WebSocketObserver(CollabBus bus, String documentId) {
+        this.bus = bus;
         this.documentId = documentId;
     }
 
     @Override
-    public void update(String documentId, String content, int version) {
-        if (this.documentId.equals(documentId)) {
-            Map<String, Object> payload = Map.of(
-                "type", "CONTENT_UPDATE",
-                "documentId", documentId,
-                "content", content,
-                "version", version
-            );
-            sessionManager.broadcast(documentId, payload);
-        }
-    }
+    public void update(ContentAppliedEvent event) {
+        if (!documentId.equals(String.valueOf(event.getDocumentId()))) return;
 
-    @Override
-    public String getUserId() { return userId; }
+        // The unicast goes out first: it is the sender's permission to release its next batch, and
+        // otClient's flush() stalls forever if it never arrives. It cannot fail over the network, and the
+        // origin session is excluded from the broadcast below, so the two never compete.
+        Map<String, Object> originFrame = event.getOriginFrame();
+        if (originFrame != null && event.getOriginSessionId() != null) {
+            bus.deliverLocal(documentId, event.getOriginSessionId(), originFrame);
+        }
+
+        Map<String, Object> frame = event.getFrame();
+        if (frame == null) return;
+
+        Map<String, Object> withPresence = new LinkedHashMap<>(frame);
+        withPresence.put("onlineCount", bus.onlineCount(documentId));
+        bus.broadcast(documentId, withPresence, event.getOriginSessionId());
+    }
 
     @Override
     public String getDocumentId() { return documentId; }

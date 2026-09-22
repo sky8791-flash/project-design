@@ -1,6 +1,8 @@
 package com.collabdoc.controller;
 
 import com.collabdoc.entity.User;
+import com.collabdoc.exception.InvalidCredentialsException;
+import com.collabdoc.security.JwtService;
 import com.collabdoc.service.UserService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -12,56 +14,52 @@ import java.util.Map;
 public class UserController {
 
     private final UserService userService;
+    private final JwtService jwtService;
 
-    public UserController(UserService userService) {
+    public UserController(UserService userService, JwtService jwtService) {
         this.userService = userService;
+        this.jwtService = jwtService;
     }
 
     @PostMapping("/register")
-    public ResponseEntity<?> register(@RequestBody Map<String, String> request) {
-        try {
-            User user = userService.createUser(
-                request.get("username"),
-                request.get("email"),
-                request.get("password")
-            );
-            return ResponseEntity.ok(Map.of(
-                "id", user.getId(),
-                "username", user.getUsername(),
-                "userCode", user.getUserCode(),
-                "role", user.getRole().name()
-            ));
-        } catch (RuntimeException e) {
-            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
-        }
+    public ResponseEntity<Map<String, Object>> register(@RequestBody Map<String, String> request) {
+        User user = userService.createUser(
+            request.get("username"),
+            request.get("email"),
+            request.get("password")
+        );
+        return ResponseEntity.ok(session(user));
     }
 
     @PostMapping("/login")
-    public ResponseEntity<?> login(@RequestBody Map<String, String> request) {
-        boolean authenticated = userService.authenticate(
-            request.get("username"),
-            request.get("password")
-        );
-        if (authenticated) {
-            User user = userService.findByUsername(request.get("username")).orElseThrow();
-            return ResponseEntity.ok(Map.of(
-                "id", user.getId(),
-                "username", user.getUsername(),
-                "userCode", user.getUserCode(),
-                "role", user.getRole().name()
-            ));
-        }
-        return ResponseEntity.status(401).body(Map.of("error", "Invalid credentials"));
+    public ResponseEntity<Map<String, Object>> login(@RequestBody Map<String, String> request) {
+        User user = userService.authenticate(request.get("username"), request.get("password"))
+            .orElseThrow(() -> new InvalidCredentialsException());
+
+        userService.requireEnabled(user);
+        return ResponseEntity.ok(session(user));
     }
 
     @GetMapping("/lookup")
     public ResponseEntity<?> lookupUser(@RequestParam String userCode) {
         return userService.findByUserCode(userCode)
-            .map(user -> ResponseEntity.ok(Map.of(
+            .<ResponseEntity<?>>map(user -> ResponseEntity.ok(Map.of(
                 "id", user.getId(),
                 "username", user.getUsername(),
                 "userCode", user.getUserCode()
             )))
-            .orElse(ResponseEntity.status(404).body(Map.of("error", "User not found")));
+            .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /** The token, not a client-declared id, is what every later request is authenticated with. */
+    private Map<String, Object> session(User user) {
+        return Map.of(
+            "id", user.getId(),
+            "username", user.getUsername(),
+            "userCode", user.getUserCode(),
+            "role", user.getRole().name(),
+            "token", jwtService.issue(user.getId(), user.getUsername(), user.getRole().name()),
+            "expiresIn", jwtService.expiresInSeconds()
+        );
     }
 }

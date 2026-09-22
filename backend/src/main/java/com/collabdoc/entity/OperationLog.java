@@ -4,7 +4,9 @@ import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "operation_log")
+@Table(name = "operation_log",
+        uniqueConstraints = @UniqueConstraint(name = "uk_oplog_doc_version",
+                columnNames = {"document_id", "version"}))
 public class OperationLog {
 
     @Id

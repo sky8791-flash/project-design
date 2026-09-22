@@ -5,7 +5,12 @@ import java.time.LocalDateTime;
 import java.util.Random;
 
 @Entity
-@Table(name = "user")
+@Table(name = "user",
+        uniqueConstraints = {
+                @UniqueConstraint(name = "uk_user_code", columnNames = "user_code"),
+                @UniqueConstraint(name = "uk_username", columnNames = "username"),
+                @UniqueConstraint(name = "uk_email", columnNames = "email")
+        })
 public class User {
 
     @Id

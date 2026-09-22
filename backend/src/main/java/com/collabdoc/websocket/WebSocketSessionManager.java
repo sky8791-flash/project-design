@@ -6,82 +6,143 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
 
 import java.io.IOException;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
 
+/**
+ * Holds the sockets this process owns and writes to them; it is the {@link LocalDelivery} that whichever
+ * {@link CollabBus} is active calls back into. Nothing here reaches a client on another node — that is
+ * the bus's job — and unicasts (INIT, ACK, REJECT) stay local, because only this node has the session.
+ */
 @Component
-public class WebSocketSessionManager {
+public class WebSocketSessionManager implements LocalDelivery {
 
     private static final Logger log = LoggerFactory.getLogger(WebSocketSessionManager.class);
-    private final ObjectMapper objectMapper = new ObjectMapper();
-    private final Map<String, Set<WebSocketSession>> documentSessions = new ConcurrentHashMap<>();
+    private static final int SEND_TIME_LIMIT_MS = 5_000;
+    private static final int SEND_BUFFER_LIMIT_BYTES = 256 * 1024;
 
-    public void register(String documentId, WebSocketSession session) {
-        documentSessions.computeIfAbsent(documentId, k -> ConcurrentHashMap.newKeySet()).add(session);
+    private final ObjectMapper objectMapper;
+    private final Map<String, Map<String, WebSocketSession>> documentSessions = new ConcurrentHashMap<>();
+    private final Map<String, Long> sessionOwners = new ConcurrentHashMap<>();
+
+    /**
+     * Uses the Spring-managed mapper on purpose: a bare {@code new ObjectMapper()} cannot serialize
+     * {@code LocalDateTime}, and frames carrying timestamps were dropped silently.
+     */
+    public WebSocketSessionManager(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    /**
+     * Stores a serialized-send view of {@code session} under its id. Nothing may send on the raw session
+     * passed in here: only the decorated one is safe against concurrent writes from broadcast threads.
+     */
+    public void register(String documentId, WebSocketSession session, Long userId) {
+        WebSocketSession outbound =
+                new ConcurrentWebSocketSessionDecorator(session, SEND_TIME_LIMIT_MS, SEND_BUFFER_LIMIT_BYTES);
+        documentSessions.computeIfAbsent(documentId, k -> new ConcurrentHashMap<>())
+                .put(session.getId(), outbound);
+        sessionOwners.put(session.getId(), userId);
     }
 
     public void unregister(String documentId, WebSocketSession session) {
-        Set<WebSocketSession> sessions = documentSessions.get(documentId);
-        if (sessions != null) {
-            sessions.remove(session);
-            if (sessions.isEmpty()) {
-                documentSessions.remove(documentId);
-            }
+        sessionOwners.remove(session.getId());
+        documentSessions.computeIfPresent(documentId, (key, sessions) -> {
+            sessions.remove(session.getId());
+            return sessions.isEmpty() ? null : sessions;
+        });
+    }
+
+    @Override
+    public void sendLocal(String documentId, String sessionId, Map<String, Object> payload) {
+        Map<String, WebSocketSession> sessions = sessionsOf(documentId);
+        if (sessions == null) return;
+        WebSocketSession session = sessions.get(sessionId);
+        if (session == null) return;
+
+        TextMessage message = serialize(payload);
+        if (message != null) {
+            deliver(session, message, documentId);
         }
     }
 
-    public void broadcast(String documentId, Map<String, Object> payload) {
-        Set<WebSocketSession> sessions = documentSessions.get(documentId);
+    @Override
+    public void deliverToDocument(String documentId, Map<String, Object> payload, String excludeSessionId) {
+        Map<String, WebSocketSession> sessions = sessionsOf(documentId);
         if (sessions == null) return;
 
-        String json;
-        try {
-            json = objectMapper.writeValueAsString(payload);
-        } catch (IOException e) {
-            return;
-        }
+        TextMessage message = serialize(payload);
+        if (message == null) return;
 
-        TextMessage textMessage = new TextMessage(json);
-        for (WebSocketSession session : sessions) {
-            if (session.isOpen()) {
-                try {
-                    session.sendMessage(textMessage);
-                } catch (IOException e) {
-                    log.warn("Failed to send broadcast to session {}: {}", session.getId(), e.getMessage());
-                }
-            }
+        for (Map.Entry<String, WebSocketSession> entry : sessions.entrySet()) {
+            if (entry.getKey().equals(excludeSessionId)) continue;
+            deliver(entry.getValue(), message, documentId);
         }
     }
 
-    public void broadcastExcept(String documentId, Map<String, Object> payload, WebSocketSession excludeSession) {
-        Set<WebSocketSession> sessions = documentSessions.get(documentId);
-        if (sessions == null) return;
+    @Override
+    public void deliverToUser(Long userId, Map<String, Object> payload) {
+        if (userId == null) return;
+        TextMessage message = serialize(payload);
+        if (message == null) return;
 
-        String json;
-        try {
-            json = objectMapper.writeValueAsString(payload);
-        } catch (IOException e) {
-            return;
-        }
-
-        TextMessage textMessage = new TextMessage(json);
-        for (WebSocketSession session : sessions) {
-            if (session.isOpen() && !session.equals(excludeSession)) {
-                try {
-                    session.sendMessage(textMessage);
-                } catch (IOException e) {
-                    log.warn("Failed to send broadcast-except to session {}: {}", session.getId(), e.getMessage());
+        sessionOwners.forEach((sessionId, owner) -> {
+            if (!userId.equals(owner)) return;
+            documentSessions.forEach((documentId, sessions) -> {
+                WebSocketSession session = sessions.get(sessionId);
+                if (session != null) {
+                    deliver(session, message, documentId);
                 }
-            }
-        }
+            });
+        });
     }
 
-    public int getOnlineCount(String documentId) {
-        Set<WebSocketSession> sessions = documentSessions.get(documentId);
+    @Override
+    public int localOnlineCount(String documentId) {
+        Map<String, WebSocketSession> sessions = sessionsOf(documentId);
         if (sessions == null) return 0;
-        return (int) sessions.stream().filter(WebSocketSession::isOpen).count();
+        return (int) sessions.values().stream().filter(WebSocketSession::isOpen).count();
+    }
+
+    @Override
+    public void forEachLiveSession(BiConsumer<String, String> visitor) {
+        documentSessions.forEach((documentId, sessions) ->
+                sessions.forEach((sessionId, session) -> {
+                    // Filter on isOpen: a session whose afterConnectionClosed never ran lingers in the map,
+                    // and re-asserting it would make it immortal in the shared membership hash.
+                    if (session.isOpen()) visitor.accept(documentId, sessionId);
+                }));
+    }
+
+    /** The map keys are {@code ConcurrentHashMap}s, so a null document id must never reach {@code get}. */
+    private Map<String, WebSocketSession> sessionsOf(String documentId) {
+        return documentId == null ? null : documentSessions.get(documentId);
+    }
+
+    private TextMessage serialize(Map<String, Object> payload) {
+        try {
+            return new TextMessage(objectMapper.writeValueAsString(payload));
+        } catch (IOException e) {
+            log.error("Failed to serialize ws payload: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * One client must never abort a fan-out. Besides {@code IOException}, the decorator throws
+     * unchecked when a slow consumer crosses the send time or buffer limit, and an escaping exception
+     * here would skip every session after it in the loop.
+     */
+    private void deliver(WebSocketSession session, TextMessage message, String documentId) {
+        if (!session.isOpen()) return;
+        try {
+            session.sendMessage(message);
+        } catch (IOException | RuntimeException e) {
+            log.warn("Failed to send to session {} on doc {}: {}", session.getId(), documentId, e.getMessage());
+        }
     }
 }

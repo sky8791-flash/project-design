@@ -1,11 +1,30 @@
 server:
   port: 8080
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # health + info only; the remaining endpoints (env, beans, heapdump) leak configuration.
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+  health:
+    redis:
+      # On the memory bus nothing ever talks to Redis, so its indicator would report the app unhealthy
+      # (503 on /actuator/health) for a dependency that is not in use. Set
+      # MANAGEMENT_HEALTH_REDIS_ENABLED=true when running app.collab.bus=redis.
+      enabled: false
 
 spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
   datasource:
     url: jdbc:mysql://localhost:3306/collabdoc?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=UTF-8
     username: root
-    password: 865103
+    password: ""
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       maximum-pool-size: 10
@@ -25,7 +44,32 @@ spring:
     serialization:
       write-dates-as-timestamps: false
 
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # No password key here on purpose: Boot's default is null, which means "do not authenticate". Set
+      # SPRING_DATA_REDIS_PASSWORD when the server has requirepass. Anyone who can reach Redis and PUBLISH
+      # on collab:frames can inject frames into every browser, so an exposed, unauthenticated Redis is an
+      # authorization bypass — docker-compose keeps 6379 unpublished for exactly that reason.
+      # onlineCount is read while the document row lock is held, so Lettuce's 60s default would let a
+      # stalled Redis block every writer of that document. Two hundred milliseconds is a lost count, not
+      # a wedged document. connect-timeout is the budget for establishing a connection, not per command.
+      timeout: 200ms
+      connect-timeout: 200ms
+
 logging:
   level:
     com.collabdoc: DEBUG
-    org.springframework.web.socket: DEBUG
+    # Never raise org.springframework.web.socket to DEBUG: its handshake logging prints the full
+    # session URI, and the socket token travels in that query string.
+
+app:
+  collab:
+    # memory: this JVM holds every socket. redis: fan frames out across instances — required as soon
+    # as more than one node runs, or a client on node B never sees what node A sequenced.
+    bus: ${COLLAB_BUS:memory}
+  jwt:
+    # Override with JWT_SECRET in any real deployment; the fallback exists only so a dev box boots.
+    secret: ${JWT_SECRET:collabdoc-development-only-secret-change-me-32b}
+    ttl: 8h

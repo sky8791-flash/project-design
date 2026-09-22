@@ -1,0 +1,55 @@
+# Local/integration environment for the collaborative editor: MySQL plus the API.
+# The SPA is served by Vite in development and by any static host in production, so it is not run here.
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: collabdoc
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - collabdb:/var/lib/mysql
+
+  redis:
+    image: redis:7-alpine
+    # Deliberately not published to the host: anyone who can reach 6379 can PUBLISH on collab:frames and
+    # inject arbitrary STEPS/RESET/NOTIFICATION frames into every browser, bypassing the server-side
+    # permission checks. Only the api containers talk to it, over this network.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Never reuse this value outside a local compose file.
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/collabdoc?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=UTF-8
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      # Deliberately not given a default: this file is in a public repository, and a literal secret here
+      # would boot fine and quietly be the real signing key. `docker compose up` fails until you set it.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET to your own 32+ character value before composing}
+      # Without the redis bus a second replica delivers frames only to the sockets it holds itself, so
+      # `docker compose up --scale api=2` needs these two lines to stay coherent. The Vite proxy targets
+      # one origin, so point the browser at whatever the load balancer in front of the replicas is.
+      COLLAB_BUS: redis
+      REDIS_HOST: redis
+      MANAGEMENT_HEALTH_REDIS_ENABLED: "true"
+    ports:
+      - "8080:8080"
+
+volumes:
+  collabdb:

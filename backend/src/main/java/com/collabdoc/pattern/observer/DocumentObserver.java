@@ -1,10 +1,10 @@
 package com.collabdoc.pattern.observer;
 
+import com.collabdoc.dto.ContentAppliedEvent;
+
 public interface DocumentObserver {
 
-    void update(String documentId, String content, int version);
-
-    String getUserId();
+    void update(ContentAppliedEvent event);
 
     String getDocumentId();
 }

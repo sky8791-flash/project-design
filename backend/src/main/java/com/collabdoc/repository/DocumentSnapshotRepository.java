@@ -8,4 +8,5 @@ import java.util.Optional;
 public interface DocumentSnapshotRepository extends JpaRepository<DocumentSnapshot, Long> {
     List<DocumentSnapshot> findByDocumentIdOrderByVersionDesc(Long documentId);
     Optional<DocumentSnapshot> findByDocumentIdAndVersion(Long documentId, Integer version);
+    Optional<DocumentSnapshot> findTopByDocumentIdOrderByVersionDesc(Long documentId);
 }

@@ -3,88 +3,36 @@ package com.collabdoc.pattern.memento;
 import com.collabdoc.entity.DocumentSnapshot;
 import com.collabdoc.repository.DocumentSnapshotRepository;
 import org.springframework.stereotype.Component;
-import java.util.ArrayList;
+
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 @Component
 public class MementoCaretaker {
 
+    private static final int MAX_SNAPSHOTS_PER_DOC = 50;
+
     private final DocumentSnapshotRepository snapshotRepository;
-    private final Map<Long, List<DocumentMemento>> historyStacks = new ConcurrentHashMap<>();
-    private final Map<Long, Integer> currentIndices = new ConcurrentHashMap<>();
-    private static final int MAX_HISTORY = 50;
 
     public MementoCaretaker(DocumentSnapshotRepository snapshotRepository) {
         this.snapshotRepository = snapshotRepository;
     }
 
-    public void saveState(String content, int version, Long documentId) {
-        DocumentMemento memento = new DocumentMemento(content, version);
-        List<DocumentMemento> historyStack = historyStacks.computeIfAbsent(documentId, k -> new ArrayList<>());
-        int currentIndex = currentIndices.getOrDefault(documentId, -1);
-
-        currentIndex++;
-        if (currentIndex < historyStack.size()) {
-            historyStack.subList(currentIndex, historyStack.size()).clear();
-        }
-        historyStack.add(memento);
-        if (historyStack.size() > MAX_HISTORY) {
-            historyStack.remove(0);
-            currentIndex--;
-        }
-        currentIndices.put(documentId, currentIndex);
-
-        DocumentSnapshot snapshot = new DocumentSnapshot(documentId, content, version);
-        snapshotRepository.save(snapshot);
+    public void capture(Long documentId, String content, String contentFormat, int version) {
+        snapshotRepository.save(new DocumentSnapshot(documentId, content, contentFormat, version));
+        prune(documentId);
     }
 
-    public DocumentMemento undo(Long documentId) {
-        List<DocumentMemento> historyStack = historyStacks.get(documentId);
-        int currentIndex = currentIndices.getOrDefault(documentId, -1);
-        if (historyStack == null || currentIndex < 0 || historyStack.isEmpty()) {
-            return null;
-        }
-        if (currentIndex > 0) {
-            currentIndex--;
-        }
-        currentIndices.put(documentId, currentIndex);
-        return historyStack.get(currentIndex);
+    /** Returns {@code null} when no snapshot was kept for that version. */
+    public DocumentMemento restore(Long documentId, int version) {
+        return snapshotRepository.findByDocumentIdAndVersion(documentId, version)
+                .map(snapshot -> new DocumentMemento(
+                        snapshot.getContent(), snapshot.getContentFormat(), snapshot.getVersion()))
+                .orElse(null);
     }
 
-    public DocumentMemento redo(Long documentId) {
-        List<DocumentMemento> historyStack = historyStacks.get(documentId);
-        int currentIndex = currentIndices.getOrDefault(documentId, -1);
-        if (historyStack == null || currentIndex < 0 || currentIndex >= historyStack.size() - 1) {
-            return null;
-        }
-        currentIndex++;
-        currentIndices.put(documentId, currentIndex);
-        return historyStack.get(currentIndex);
-    }
-
-    public void reset(Long documentId) {
-        historyStacks.remove(documentId);
-        currentIndices.remove(documentId);
-    }
-
-    public void loadHistoryFromDatabase(Long documentId) {
+    private void prune(Long documentId) {
         List<DocumentSnapshot> snapshots = snapshotRepository.findByDocumentIdOrderByVersionDesc(documentId);
-        List<DocumentMemento> historyStack = new ArrayList<>();
-        int currentIndex = -1;
-
-        for (DocumentSnapshot snapshot : snapshots) {
-            DocumentMemento memento = new DocumentMemento(snapshot.getContent(), snapshot.getVersion());
-            historyStack.add(0, memento);
-            currentIndex++;
-        }
-
-        if (!historyStack.isEmpty()) {
-            currentIndex = historyStack.size() - 1;
-        }
-
-        historyStacks.put(documentId, historyStack);
-        currentIndices.put(documentId, currentIndex);
+        if (snapshots.size() <= MAX_SNAPSHOTS_PER_DOC) return;
+        snapshotRepository.deleteAll(snapshots.subList(MAX_SNAPSHOTS_PER_DOC, snapshots.size()));
     }
 }

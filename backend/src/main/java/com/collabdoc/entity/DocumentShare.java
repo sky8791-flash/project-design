@@ -4,7 +4,9 @@ import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "document_share")
+@Table(name = "document_share",
+        uniqueConstraints = @UniqueConstraint(name = "uk_doc_user", columnNames = {"document_id", "user_id"}),
+        indexes = @Index(name = "idx_share_user", columnList = "user_id"))
 public class DocumentShare {
 
     @Id
