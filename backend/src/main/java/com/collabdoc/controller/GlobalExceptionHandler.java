@@ -69,9 +69,10 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Spring MVC's own signals must keep the status they carry. A mistyped id, a wrong verb, an unknown
-     * path or an unreadable body all surface as one of these; the catch-all below would otherwise turn a
-     * 404 into a 500 and make a bad URL look like a server fault.
+     * Spring MVC's own signals must keep the status they carry. A wrong verb, an unknown path or an
+     * unreadable body all surface as one of these; the catch-all below would otherwise turn a 404 into a
+     * 500 and make a bad URL look like a server fault. A mistyped path variable is not one of them —
+     * {@code MethodArgumentTypeMismatchException} belongs to {@link #badRequest}.
      */
     @ExceptionHandler({ErrorResponseException.class,
             NoResourceFoundException.class,

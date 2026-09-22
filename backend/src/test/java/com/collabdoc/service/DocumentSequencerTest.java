@@ -39,6 +39,7 @@ class DocumentSequencerTest {
     @Autowired private ObjectMapper objectMapper;
 
     private Long ownerId;
+    private String ownerName;
     private Long docId;
     private JsonNode steps;
 
@@ -47,6 +48,7 @@ class DocumentSequencerTest {
         // A real row: created_by carries no foreign key, so a hardcoded id would insert happily and the
         // history assertions would be reading the "unknown user" fallback instead of a name.
         String name = "sequencer-" + UUID.randomUUID().toString().substring(0, 8);
+        ownerName = name;
         ownerId = userService.createUser(name, name + "@test.local", "pw123456").getId();
         Document doc = documentService.createDocument("sequencer", ownerId);
         docId = doc.getId();
@@ -131,6 +133,11 @@ class DocumentSequencerTest {
         assertThat(List.of(first, second, third)).containsExactly(1, 2, 3);
         assertThat(operationLogRepository.findByDocumentIdOrderByVersionAsc(docId))
             .extracting(OperationLog::getVersion).containsExactly(1, 2, 3);
+        // The history view resolves the author through the user row and folds the retained snapshots in as
+        // their own entries, so a fabricated owner id would read back as "未知用户" instead of this name.
+        assertThat(documentService.getOperationHistory(docId))
+            .extracting(com.collabdoc.dto.OperationLogDTO::getUsername)
+            .containsExactly("系统检查点", ownerName, ownerName, ownerName);
     }
 
     @Test

@@ -3,6 +3,7 @@ package com.collabdoc.websocket;
 import com.collabdoc.dto.DocumentState;
 import com.collabdoc.exception.ConflictException;
 import com.collabdoc.exception.ForbiddenException;
+import com.collabdoc.exception.NotFoundException;
 import com.collabdoc.pattern.observer.DocumentSubject;
 import com.collabdoc.pattern.observer.WebSocketObserver;
 import com.collabdoc.security.AuthUser;
@@ -143,17 +144,18 @@ public class DocumentWebSocketHandler extends TextWebSocketHandler {
         if (steps == null || !steps.isArray() || steps.toString().length() > MAX_STEPS_JSON_CHARS) {
             return;
         }
-        // A socket is authenticated once at handshake; without this re-check an account that is disabled
-        // or deleted while the tab stays open would keep writing through that connection forever.
-        AuthUser current = jwtAuthFilter.authenticate(participant.token());
-        if (current == null) {
-            log.info("Closing session {}: token no longer valid", session.getId());
-            session.close(NO_ACCESS);
-            return;
-        }
         String clientId = payload.path("clientId").asText(session.getId());
 
         try {
+            // A socket is authenticated once at handshake; without this re-check an account that is
+            // disabled or deleted while the tab stays open would keep writing through that connection
+            // forever. It is a database read, so it belongs inside the guard below.
+            AuthUser current = jwtAuthFilter.authenticate(participant.token());
+            if (current == null) {
+                log.info("Closing session {}: token no longer valid", session.getId());
+                session.close(NO_ACCESS);
+                return;
+            }
             documentService.appendStepBatch(
                     Long.parseLong(participant.documentId()),
                     current.id(),
@@ -168,7 +170,9 @@ public class DocumentWebSocketHandler extends TextWebSocketHandler {
             reject.put("clientId", clientId);
             reject.put("version", e.getCurrentVersion());
             bus.deliverLocal(participant.documentId(), session.getId(), reject);
-        } catch (ForbiddenException e) {
+        } catch (ForbiddenException | NotFoundException e) {
+            // NotFound means the document was deleted under an open tab; that is a closed session, not a
+            // server fault (an escaping exception would reach the container and close with a generic 1011).
             log.info("Closing session {}: {}", session.getId(), e.getMessage());
             session.close(NO_ACCESS);
         }
@@ -224,11 +228,14 @@ public class DocumentWebSocketHandler extends TextWebSocketHandler {
 
     private boolean isNumeric(String value) {
         if (value == null || value.isEmpty()) return false;
-        // Also a length bound: Long.parseLong throws for anything over 19 digits, and an exception out of
-        // afterConnectionEstablished closes the socket with a generic 1011 instead of the 4004 this is.
+        // Long.MAX_VALUE has 19 digits, so 18 keeps parseLong from throwing; an escaping exception would
+        // close with a generic 1011 instead of this method's 4004.
         if (value.length() > 18) return false;
         for (int i = 0; i < value.length(); i++) {
-            if (!Character.isDigit(value.charAt(i))) return false;
+            // Explicit ASCII range: Character.isDigit accepts Unicode digits, and parseLong agrees with
+            // them today, but the canonical document key must not rest on that implementation detail.
+            char c = value.charAt(i);
+            if (c < '0' || c > '9') return false;
         }
         return true;
     }

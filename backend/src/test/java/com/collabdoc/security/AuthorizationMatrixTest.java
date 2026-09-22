@@ -126,6 +126,12 @@ class AuthorizationMatrixTest {
         mvc.perform(bearer(delete("/api/documents/me"), token)).andExpect(status().isBadRequest());
         mvc.perform(bearer(patch("/api/documents/1"), token)).andExpect(status().isMethodNotAllowed());
         mvc.perform(bearer(get("/api/documents/nope/nope/nope"), token)).andExpect(status().isNotFound());
+        // The case that motivated the Throwable widening: MissingServletRequestParameterException is a
+        // checked exception, so a handler parametered on RuntimeException never ran for it and the body
+        // silently reverted to Boot's default error shape while the status still said 400.
+        mvc.perform(bearer(get("/api/users/lookup"), token))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").exists());
     }
 
     @Test
@@ -235,9 +241,9 @@ class AuthorizationMatrixTest {
     void tamperedSignatureAndUnknownAccountAreBothRefused() throws Exception {
         User user = newUser();
         String token = tokenOf(user);
-        // Corrupt the first character of the signature segment. The last one is tempting but unsound: a
-        // base64url tail carries only two significant bits, and the decoder ignores the rest, so some
-        // "tampered" tokens verify identically to the original.
+        // Corrupt the first character of the signature segment. The last one is tempting but unsound: for
+        // a 32-byte HS256 signature the 43rd base64url character carries only four significant bits and
+        // two ignored ones, so some tail-tampered tokens verify identically to the original.
         int signatureStart = token.lastIndexOf('.') + 1;
         char first = token.charAt(signatureStart);
         String tampered = token.substring(0, signatureStart) + (first == 'a' ? 'b' : 'a')

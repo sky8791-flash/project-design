@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS `document_share` (
     `id`          BIGINT AUTO_INCREMENT PRIMARY KEY,
     `document_id` BIGINT      NOT NULL,
     `user_id`     BIGINT      NOT NULL,
-    `permission`  VARCHAR(20) NOT NULL COMMENT 'READ_WRITE | READ_ONLY',
+    `permission`  VARCHAR(255) NOT NULL COMMENT 'READ_WRITE | READ_ONLY',
     `shared_by`   BIGINT      NOT NULL,
     `created_at`  DATETIME(6) NOT NULL,
     UNIQUE KEY `uk_doc_user` (`document_id`, `user_id`),

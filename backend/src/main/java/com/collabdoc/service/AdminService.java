@@ -82,7 +82,7 @@ public class AdminService {
         return rawPassword;
     }
 
-    /** Deleting an account takes its documents with it; the FKs leave no other choice. */
+    /** Deleting an account takes its documents with it; nothing in the schema cascades, so this is the only cleanup. */
     public void deleteUser(Long id) {
         User user = getUser(id);
         if (id.equals(UserSecurity.currentUserId())) {

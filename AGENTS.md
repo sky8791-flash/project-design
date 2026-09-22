@@ -23,13 +23,17 @@ Backend (run from `backend/`):
 mvn spring-boot:run -Dspring-boot.run.profiles=dev   # http://localhost:8080, schema in collabdoc_dev
 mvn spring-boot:run                                  # default profile, schema in collabdoc
 mvn -o -DskipTests package
-mvn test                                             # 36 tests on in-memory H2, no MySQL needed
+mvn test                                             # 39 tests on in-memory H2, no MySQL needed
 ```
 
-`CollabInvariantTest` and `DocumentSequencerTest` are the ones that encode *why* the design is correct (see
-the I1–I6 list in the plan doc): uniqueness/monotonicity of the sequence, gapless replay, no self-echo, and
-no fan-out for a rolled-back write. `rolledBackWriteFansOutNothing` is paired with
-`committedWriteFansOutExactlyOnce` on purpose, so the former cannot pass because nothing ever publishes.
+`CollabInvariantTest` and `DocumentSequencerTest` encode *why* the design is correct: the sequence is unique
+and monotonic, the replay log is gapless and still carries the submitted steps, a content frame is never
+echoed to its own session (asserted at the session map, where the exclusion actually happens, and by frame
+`type` — an `equals` matcher could never match the presence-stamped copy the observer broadcasts), a rolled
+back write fans out nothing, and one attached observer per document wins over the no-viewer fallback.
+`rolledBackWriteFansOutNothing` is paired with `committedWriteFansOutExactlyOnce` so the former cannot pass
+because nothing ever publishes. The exclusion test was checked by mutation: neutralising
+`WebSocketSessionManager`'s `continue` turns exactly that one test red.
 
 `mvn test` uses `src/test/resources/application-test.yml` (H2 in MySQL mode, `create-drop`). First run
 needs network for the surefire provider and the pinned `h2:2.3.232`; after that `-o` works. Two H2 quirks
@@ -276,8 +280,9 @@ that.
   value types inside a class (see `DocumentWebSocketHandler.Participant`).
 - Status mapping lives in **one** place: `controller/GlobalExceptionHandler` is a `@RestControllerAdvice`
   covering `InvalidCredentials` → 401, `NotFound` → 404, `Forbidden|AccessDenied` → 403, `Conflict` → 409
-  (+ the current version), `IllegalArgument|IllegalState` and bad request params → 400. Controllers have no
-  try/catch left; do not re-scope the mapping per controller.
+  (+ the current version), `IllegalArgument|IllegalState` and bad request params → 400. No controller maps
+  an exception to an HTTP status; the few remaining `try/catch` blocks only convert a malformed field into
+  `IllegalArgumentException`. Do not re-scope the mapping per controller.
   Its catch-all `Exception` handler is why that class also maps Spring MVC's own signals
   (`NoResourceFoundException`, `HttpRequestMethodNotSupportedException`, `HttpMessageNotReadableException`,
   `MethodArgumentTypeMismatchException`) — without those, a mistyped id or an unknown path becomes a 500

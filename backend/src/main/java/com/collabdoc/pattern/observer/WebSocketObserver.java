@@ -25,8 +25,9 @@ public class WebSocketObserver implements DocumentObserver {
         if (!documentId.equals(String.valueOf(event.getDocumentId()))) return;
 
         // The unicast goes out first: it is the sender's permission to release its next batch, and
-        // otClient's flush() stalls forever if it never arrives. It cannot fail over the network, and the
-        // origin session is excluded from the broadcast below, so the two never compete.
+        // otClient's flush() stalls forever if it never arrives. It involves no broker round trip, so a
+        // Redis outage cannot take it down with the broadcast, and the origin session is excluded from the
+        // broadcast below, so the two never compete.
         Map<String, Object> originFrame = event.getOriginFrame();
         if (originFrame != null && event.getOriginSessionId() != null) {
             bus.deliverLocal(documentId, event.getOriginSessionId(), originFrame);
