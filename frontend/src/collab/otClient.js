@@ -30,6 +30,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   let checkpointDue = false
   let tail = Promise.resolve()
   let destroyed = false
+  let haltedAt = null
 
   const listeners = { version: [], presence: [], reset: [], error: [] }
   const emit = (kind, payload) => listeners[kind].forEach((fn) => fn(payload))
@@ -120,7 +121,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   }
 
   const flush = () => {
-    if (outstanding || !ws.isConnected()) return
+    if (haltedAt !== null || outstanding || !ws.isConnected()) return
     const next = pending.find((batch) => !batch.sent && batch.inDocument)
     if (next) {
       // Everything earlier is acknowledged, so the server's current version is this batch's base.
@@ -146,6 +147,26 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   const fetchState = async () => {
     const { data } = await api.get(`/api/documents/${documentId}`)
     return data
+  }
+
+  /**
+   * Ends the replay at a row this client cannot apply.
+   *
+   * The server orders step JSON without interpreting it, so any writer can commit a batch no reader can
+   * apply — a hand-built offset, a slice that does not fit, a client working from a document it never
+   * fetched. Retrying that is not a delay but a loop: the rebuild replays the same row, fails the same way,
+   * and the tab never becomes usable again. So the row is recorded, everything above it is left unapplied,
+   * the local queue stops going out, and the user sees where the content stopped.
+   *
+   * This is a truthful dead end, not a repair: the tail genuinely cannot be replayed, and only someone with
+   * write access restoring an older version can make the document whole again.
+   */
+  const haltAt = (rowVersion, error) => {
+    if (haltedAt !== null) return
+    haltedAt = rowVersion
+    console.error(`collab: history cannot be replayed past v${rowVersion}`, error)
+    emit('error', new Error(
+      `无法重放 v${rowVersion} 之后的历史，内容停在 v${version}；这里的后续编辑不会被保存，刷新页面可重试`))
   }
 
   /**
@@ -187,14 +208,20 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
         return
       }
       const params = JSON.parse(log.commandParams)
-      if (params.clientId === clientId) {
-        acknowledge(log.version)
-        // Our own row is still somebody else's batch as far as this document is concerned: the user may have
-        // typed while the network call was in flight, and replaying the row at its original offsets would
-        // land it inside that work instead of beside it.
-        if (replayOwn) applySteps(integrate(stepsFrom(params.steps || [])))
-      } else {
-        applySteps(integrate(stepsFrom(params.steps || [])))
+      try {
+        const steps = stepsFrom(params.steps || [])
+        if (params.clientId === clientId) {
+          acknowledge(log.version)
+          // Our own row is still somebody else's batch as far as this document is concerned: the user may have
+          // typed while the network call was in flight, and replaying the row at its original offsets would
+          // land it inside that work instead of beside it.
+          if (replayOwn) applySteps(integrate(steps))
+        } else {
+          applySteps(integrate(steps))
+        }
+      } catch (error) {
+        haltAt(log.version, error)
+        return
       }
       version = log.version
     }
@@ -204,9 +231,14 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
 
   const handleSteps = (frame) =>
     enqueue(async () => {
+      if (haltedAt !== null) return
       const seq = frame.version
       if (seq <= version) return
       if (seq > version + 1) await catchUp(seq - 1)
+      // The gap may have ended in a halt. Continuing would apply this frame and adopt its version, so the tab
+      // would hold a version whose content it never received — and the next checkpoint it uploads folds away
+      // exactly the rows it skipped.
+      if (haltedAt !== null) return
       // Closing that gap can rebuild the whole document (a nested bootstrap adopts the newest version), in
       // which case this frame's own steps are already applied.
       if (seq <= version) return
@@ -227,6 +259,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
 
   const handleAck = (frame) =>
     enqueue(async () => {
+      if (haltedAt !== null) return
       if (frame.clientId !== clientId) return
       // The batch may already have been dropped (all its steps deleted by a concurrent edit), but its
       // version still has to be adopted or every later batch would be rejected against a stale base.
@@ -243,6 +276,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
 
   const handleReject = (frame) =>
     enqueue(async () => {
+      if (haltedAt !== null) return
       if (frame.clientId !== clientId || !outstanding) return
       // The version a rejection carries is the server's current one, so anything at or below this batch's
       // base is answering an older batch — reverting the current one would have it sent twice.
@@ -253,6 +287,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
       // It stays at the head of `pending` while we catch up, so integrate() re-maps its steps over the
       // operations we are about to apply; sending it at its old offsets would corrupt the document.
       await catchUp(frame.version)
+      if (haltedAt !== null) return
       rejected.base = version
       if (!rejected.steps.length) pending = pending.filter((batch) => batch !== rejected)
       emit('version', version)
@@ -260,6 +295,9 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     })
 
   const uploadCheckpoint = async () => {
+    // While halted, this client's version describes a document it cannot reproduce: snapshotting it would
+    // fold away the rows above the poison for everybody, replacing history this tab never read.
+    if (haltedAt !== null) return
     // Uploading while local steps are unacknowledged would burn private work into the snapshot at a
     // version that does not contain it, and everyone would replay that work twice.
     if (pending.length) {
@@ -298,6 +336,10 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     setContent(state.content, state.contentFormat ?? 'html', state.checkpointVersion ?? state.version)
     emit('presence', state.onlineCount)
     if (state.version > version) await catchUp(state.version, { replayOwn: true })
+    // A halt mid-replay means this document's tail cannot be read at all, so the rebuild stopped short of
+    // `state.version`. Reviving parked batches onto a half-rebuilt document would place them at offsets that
+    // no longer exist — stay frozen instead, and let someone restore an older version.
+    if (haltedAt !== null) return
 
     // A sent batch whose version the *checkpoint* has passed cannot be recovered from the log any more: rows
     // at or below it were folded and deleted when that checkpoint was recorded, and folding only ever
@@ -330,6 +372,11 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
 
   const handleReset = (frame) =>
     enqueue(async () => {
+      // A late, out-of-order reset must not downgrade the version or lift a halt belonging to newer history.
+      if (frame.version < version) return
+      // A reset replaces the whole document, so the row that halted the replay is no longer in anyone's
+      // history: this is the one legitimate way out of a halt, and the tab must be able to use it.
+      haltedAt = null
       pending = []
       outstanding = null
       setContent(frame.content, frame.contentFormat, frame.version)
@@ -350,12 +397,12 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     handleReset,
     setContent,
     bootstrap,
-    resync: () => enqueue(async () => bootstrapNow(await fetchState())),
     requestCheckpoint: () => enqueue(() => uploadCheckpoint()),
     on,
     get version() { return version },
     get contentFormat() { return contentFormat },
     get hasUnacked() { return pending.length > 0 },
+    get halted() { return haltedAt !== null },
     destroy
   }
 }

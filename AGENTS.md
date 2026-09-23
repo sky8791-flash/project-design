@@ -123,9 +123,10 @@ the incoming side logs it, because refusing to apply incoming steps instead woul
 tab that never catches up. Frames are handled through one
 serialized promise chain because the server fans frames out after commit, so two writers' frames can
 arrive out of order; a version gap is closed by refetching `GET /api/documents/{id}/operations?after=`.
-Any error in that chain falls back to `resync()`.
+Any error in that chain rebuilds the whole client state from the server — except a history row that cannot
+be applied, which halts instead (see the next paragraph).
 
-Whole-document state is only ever replaced on `INIT`, `RESET` and resync, and always with
+Whole-document state is only ever replaced on `INIT`, `RESET`, and the rebuild that any other error triggers, and always with
 `setContent(content, { emitUpdate: false })` — a plain `setContent` would echo the whole document back
 as a local step batch.
 
@@ -288,6 +289,31 @@ and the crash the earlier reports blamed on out-of-order frames was this same li
 The fix is `tr.step(step)` — the public wrapper that applies the step and passes `result.doc` to `addStep`.
 The public API to remember: `tr.step` (throws `TransformError` if the step does not apply), `tr.maybeStep`
 (skips it), `tr.addStep` (never — the caller would have to compute the document itself).
+
+**An unappliable history row halts the client, on purpose.** Because the server orders step JSON it never
+interprets, *any* writer can commit a batch no reader can apply — `from: 999` on a five-character document is
+accepted and sequenced like anything else. Retrying that is not a delay but a loop: the rebuild replays the
+same row and fails the same way, and the tab never becomes usable. `catchUp` therefore catches the failure,
+records `haltedAt` and stops. While halted: `flush` refuses, `handleSteps`/`handleAck`/`handleReject` refuse
+(both after the `catchUp` await — the case review caught was `handleSteps` continuing past a halt, applying
+the triggering frame and adopting its version, which would let the next checkpoint this tab uploads fold away
+the rows it skipped), `uploadCheckpoint` refuses (a halted tab must not describe a document it cannot
+reproduce), and `bootstrapNow` returns before reviving parked batches onto a half-rebuilt document.
+`handleReset` is the deliberate exception: a reset replaces the history that caused the halt, so it clears
+the flag — guarded by `frame.version < version` so a late, out-of-order reset cannot downgrade the version or
+lift a halt belonging to newer history. The halt is otherwise **sticky for the life of the client**; if the
+log is repaired underneath it, a reload is the way back (a fresh client re-checks). The user sees
+`无法重放 v{n} 之后的历史，内容停在 v{m}；这里的后续编辑不会被保存，刷新页面可重试`.
+
+Rejected alternatives: falling back to the last checkpoint throws away replayable history and still needs a
+human; making the server validate applicability drags content interpretation back into the sequencer, the one
+principle this design rests on. Reproduce: commit `GOOD` at position 1, then `{stepType:'replace',from:999,
+to:999,...}`, then anything else, and open the document. Observed 2026-09-23: content `GOOD`, one console
+error (`RangeError: Position 999 out of range`), **no** rebuild-retry line, message visible; while halted a
+further row committed by another client (v4) was ignored — text unchanged, no version adopted; after
+`POST /{id}/restore/{version}` the message cleared and typing reached the server (v5). Not exercised: the
+`uploadCheckpoint` halt guard and the reset-staleness guard are reasoned, not observed — reaching them needs a
+peer to fold the log past the poison, and this environment refused that write.
 
 **Exercising these paths without a second browser tab** (the agent browser blocks popups; two real tabs as
 two users, per *Verifying changes* below, remains the better test): log in, open `/#/doc/{id}`, and drive the

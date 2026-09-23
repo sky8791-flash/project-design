@@ -447,6 +447,9 @@ const startSession = async () => {
     })
     collab.value.on('version', (value) => {
       currentVersion.value = value
+      // Progress is what retires a sync message from the status line. A replay halt is the exception: the
+      // version emitted around the rebuild says nothing about the row this client could not read.
+      if (!collab.value.halted) statusError.value = ''
     })
     // A reset replaces the whole document, so the mapped caret positions it inherited are meaningless.
     collab.value.on('reset', () => {
