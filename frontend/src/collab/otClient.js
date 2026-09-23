@@ -279,8 +279,10 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
       if (haltedAt !== null) return
       if (frame.clientId !== clientId || !outstanding) return
       // The version a rejection carries is the server's current one, so anything at or below this batch's
-      // base is answering an older batch — reverting the current one would have it sent twice.
-      if (frame.version <= outstanding.base) return
+      // base is answering an older batch — reverting the current one would have it sent twice. Our view of
+      // the version is then wrong, and rebuilding is the only way out: returning here would wedge the tab
+      // behind a batch it can neither send nor abandon.
+      if (frame.version <= outstanding.base) return bootstrapNow(await fetchState())
       const rejected = outstanding
       rejected.sent = false
       outstanding = null

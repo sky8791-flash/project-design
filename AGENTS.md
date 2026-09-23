@@ -311,9 +311,15 @@ principle this design rests on. Reproduce: commit `GOOD` at position 1, then `{s
 to:999,...}`, then anything else, and open the document. Observed 2026-09-23: content `GOOD`, one console
 error (`RangeError: Position 999 out of range`), **no** rebuild-retry line, message visible; while halted a
 further row committed by another client (v4) was ignored — text unchanged, no version adopted; after
-`POST /{id}/restore/{version}` the message cleared and typing reached the server (v5). Not exercised: the
-`uploadCheckpoint` halt guard and the reset-staleness guard are reasoned, not observed — reaching them needs a
-peer to fold the log past the poison, and this environment refused that write.
+`POST /{id}/restore/{version}` the message cleared and typing reached the server (v5). Both guards were then
+probed directly, without any whole-document write: dispatching `beforeunload` on a halted tab records nothing
+(`checkpointVersion` still 0 and rows 1..3 unfolded, identical to a control document that never saw the probe),
+and injecting a frame into the socket's own `onmessage` shows the reset guard biting both ways — `RESET
+version 0` is ignored (text and halt unchanged) while `RESET version 9` applies, clears the halt and lets the
+tab type again. That last run is also what turned the reject guard from a silent drop into a rebuild: a
+rejection the client cannot attribute to its outstanding batch left the tab holding a version the server
+never announced, unable to send or abandon it. Reaching that state needs a frame a real server will not
+produce, so the rebuild fallback is reasoned rather than observed.
 
 **Exercising these paths without a second browser tab** (the agent browser blocks popups; two real tabs as
 two users, per *Verifying changes* below, remains the better test): log in, open `/#/doc/{id}`, and drive the
