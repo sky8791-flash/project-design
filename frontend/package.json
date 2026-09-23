@@ -11,8 +11,6 @@
   },
   "dependencies": {
     "@tiptap/core": "^3.23.4",
-    "@tiptap/extension-collaboration": "^3.23.4",
-    "@tiptap/extension-collaboration-cursor": "^2.26.2",
     "@tiptap/pm": "^3.23.4",
     "@tiptap/starter-kit": "^3.23.4",
     "@tiptap/vue-3": "^3.23.4",
