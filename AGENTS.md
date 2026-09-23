@@ -119,8 +119,8 @@ exactly `base + 1`, so `acknowledge(version)` releases only the batch carrying t
 of our own rows" flag spans everything above the checkpoint (up to `CHECKPOINT_EVERY` versions of older
 work) and loses or duplicates the batch the user is waiting on. A step that maps to nothing is dropped on
 both sides of the mapping — that is the correct OT answer when an unacknowledged delete took its target — and
-only logged, because refusing to apply incoming steps instead would trade one lost range for a tab that never
-catches up. Frames are handled through one
+the incoming side logs it, because refusing to apply incoming steps instead would trade one lost range for a
+tab that never catches up. Frames are handled through one
 serialized promise chain because the server fans frames out after commit, so two writers' frames can
 arrive out of order; a version gap is closed by refetching `GET /api/documents/{id}/operations?after=`.
 Any error in that chain falls back to `resync()`.
@@ -372,12 +372,13 @@ tabs as two different users (share it `READ_WRITE` first). Things worth watching
   (DevTools → the socket's Messages tab, filter on `STEPS`).
 - `USER_LEFT` arrives **with** `onlineCount` and the number goes down when a tab closes.
 - Typing in both tabs simultaneously: one batch is acked, the other receives `REJECT`, and both tabs
-  converge on the same text with no caret jumps. **Verified 2026-09-23** on the recipe above: a tab held its
-  own `STEP_BATCH`, a scripted writer committed `REMOTE` at the same base, the tab applied that frame live
-  (`LOCALREMOTE`), the held batch was then delivered and came back `REJECT`ed, `catchUp` + rebase resent it,
-  and the server ended on `v2` with one row each — then a reload rebuilt the identical text, and fresh
-  typing still worked (`v3`). What has *not* been tested is that second browser tab as a peer: the scripted
-  writer has no editor, so nothing asserts that two ProseMirror views converge on the same positions.
+  converge on the same text with no caret jumps. Exercised 2026-09-23 with the recipe above — one browser tab
+  plus one scripted writer, **not** two editors: the tab applied a peer's frame live while its own batch was
+  in flight; a stale-base batch was delivered, came back `REJECT`ed, was rebased and committed; text typed
+  while the socket was down was parked by the reconnect bootstrap and revived exactly once; and remounting the
+  editor rebuilt the identical text from `operation_log`. Still untested: a second real editor peer, so nobody
+  has watched two ProseMirror views land on the same positions; and `bootstrapNow`'s `folded` band needs 200
+  committed versions to reach, so it has never executed.
 - `SELECT document_id, version, COUNT(*) FROM operation_log GROUP BY 1,2 HAVING COUNT(*) > 1` → empty,
   same for `document_snapshot`.
 - Restarting the backend keeps history (`GET /{id}/history`), and restoring a version makes `version`

@@ -160,7 +160,6 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   const acknowledge = (committedVersion) => {
     const batch = pending.find((candidate) => candidate.sent && candidate.base + 1 === committedVersion)
     if (!batch) return
-    batch.committed = true
     pending = pending.filter((candidate) => candidate !== batch)
     if (outstanding === batch) outstanding = null
   }
@@ -190,7 +189,10 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
       const params = JSON.parse(log.commandParams)
       if (params.clientId === clientId) {
         acknowledge(log.version)
-        if (replayOwn) applySteps(stepsFrom(params.steps || []))
+        // Our own row is still somebody else's batch as far as this document is concerned: the user may have
+        // typed while the network call was in flight, and replaying the row at its original offsets would
+        // land it inside that work instead of beside it.
+        if (replayOwn) applySteps(integrate(stepsFrom(params.steps || [])))
       } else {
         applySteps(integrate(stepsFrom(params.steps || [])))
       }
@@ -307,7 +309,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     const rebuiltFrom = state.checkpointVersion ?? state.version
     const folded = (batch) => batch.sent && batch.base + 1 <= rebuiltFrom
     const waiting = pending.filter((batch) =>
-      !batch.inDocument && !batch.committed && !folded(batch) && batch.steps.length)
+      !batch.inDocument && !folded(batch) && batch.steps.length)
     // Keep whatever became `inDocument` while the replay was in flight — the user went on typing — and drop
     // everything else from the list before re-adding the revived batches on top.
     pending = pending.filter((batch) => batch.inDocument)
