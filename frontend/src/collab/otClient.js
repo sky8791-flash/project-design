@@ -99,20 +99,26 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
    * halted. Replaying ours through `mapping.slice(mapFrom)` with the mirror set is what keeps the order the
    * server chose: ours goes after theirs, always, because ours has no sequence number yet.
    *
-   * A lift that throws or a replay that no longer applies is a step whose content another writer removed;
-   * `maybeStep` drops it, matching upstream. The incoming steps are applied with `step`, so an unappliable
-   * history row still reaches `haltAt` rather than being skipped.
+   * A lift that cannot be applied aborts the whole rebase — it would mean our own recorded step no longer
+   * describes this document, and there is no sensible way to continue with a partially lifted state; the error
+   * reaches `haltAt` or the rebuild. A *replay* that no longer applies is dropped instead, as upstream does:
+   * that is the ordinary case of a peer having deleted the content the step carried. The incoming steps are
+   * applied with `step`, so an unappliable history row still throws rather than being skipped.
    */
   const rebaseOver = (incoming, atVersion = null) => {
     const overTheirs = new Mapping(incoming.map((step) => step.getMap()))
 
-    // A parked batch's steps are expressed against the version it was built on, so everything the replay
-    // applies above that version has to shift them as well. Revive them verbatim and they land at offsets from
-    // a document that no longer exists — consistent with the log, and wrong in it, because the stale offset is
-    // what gets submitted next.
+    // A batch's `seen` is the log version its steps are already relative to. Parked steps have to be shifted
+    // over everything the replay applies above that watermark and no further: a rebuild replays rows the
+    // original rebase had already folded in, and shifting them a second time walks the batch off the end of
+    // the document — which then throws on revive and halts the tab over perfectly good history. Reviving
+    // without a needed shift is worse still, because the stale offset is what gets submitted next and becomes
+    // everyone's history, so `seen` has to be both current and never behind what the steps already include.
     if (atVersion !== null) {
       pending.forEach((batch) => {
-        if (batch.inDocument || batch.base >= atVersion) return
+        const needsShift = !batch.inDocument && batch.seen < atVersion
+        batch.seen = Math.max(batch.seen, atVersion)
+        if (!needsShift) return
         batch.entries = batch.entries.flatMap((entry) => {
           const mapped = entry.step.map(overTheirs)
           return mapped ? [{ step: mapped, inverted: entry.inverted, batch }] : []
@@ -150,6 +156,12 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     })
     pending = pending.filter((batch) => !batch.inDocument || batch.entries.length)
     if (outstanding && outstanding.inDocument && !outstanding.entries.length) outstanding = null
+    // `prosemirror-history` rebases its own stored steps only if it is told this transaction did it: the
+    // number is how many items at the end of its branch are ours, and the transform's first steps must be
+    // exactly the lifts those items are matched against by mirror index. Without the meta it just appends map
+    // items, so an undo after a peer edit can re-apply an inverse computed against a document that no longer
+    // exists. It also needs a plugin in the state declaring `historyPreserveItems` — see `collabHistory.js`.
+    tr.setMeta('rebased', ours.length)
     editor.view.dispatch(tr)
   }
 
@@ -176,6 +188,21 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   }
 
   /**
+   * A batch starts at the version the document is on, plus one for every in-document batch it sits on top of:
+   * steps typed after those already include their content, so a rebuild must not shift those rows onto them
+   * again. Both directions of that mistake lose text — shifting twice walks a batch off the end of the document
+   * and halts the tab on history that is perfectly replayable, and failing to shift revives it at an offset
+   * that then gets submitted and becomes everyone's history.
+   */
+  const newBatch = () => ({
+    base: version,
+    seen: version + pending.filter((batch) => batch.inDocument).length,
+    entries: [],
+    sent: false,
+    inDocument: true
+  })
+
+  /**
    * Called with every transaction a local edit produced, after ProseMirror has applied them. TipTap hands the
    * root transaction and the `appendTransaction` output separately, and StarterKit's trailing paragraph is one
    * of the appended ones — a step that reaches the document but not this batch is content no peer will ever
@@ -190,7 +217,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
       if (last && !last.sent && last.inDocument && last.base === version) {
         last.entries = last.entries.concat(entriesFrom(tr, last))
       } else {
-        const batch = { base: version, entries: [], sent: false, inDocument: true }
+        const batch = newBatch()
         batch.entries = entriesFrom(tr, batch)
         pending.push(batch)
       }

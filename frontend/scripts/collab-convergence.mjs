@@ -12,8 +12,10 @@
  * of random interleavings plus the specific orderings that used to be bugs.
  *
  * Scope worth stating: the schema is hand-built with the node and mark names TipTap uses, so this covers step
- * mapping, sequencing and the recovery paths. It does not cover what a TipTap extension or plugin adds (input
- * rules, history, decorations), and it never touches the HTTP or WebSocket layer — the browser runs recorded in
+ * mapping, sequencing and the recovery paths. It checks that a rebase announces itself to `prosemirror-history`
+ * with the right count, but it has no history plugin, so what undo does with that signal is not covered here —
+ * nor is anything else a TipTap extension adds (input rules, decorations), nor the HTTP and WebSocket layers,
+ * which the browser runs recorded in
  * AGENTS.md cover those.
  */
 import { Schema, Slice } from '@tiptap/pm/model'
@@ -55,14 +57,16 @@ const editableRanges = (doc) => {
  */
 const fakeEditor = () => {
   let state = EditorState.create({ schema, doc: emptyDoc() })
+  const rebases = []
   return {
     get state() {
       return state
     },
-    view: { dispatch: (tr) => { state = state.apply(tr) } },
+    view: { dispatch: (tr) => { if (tr.getMeta('rebased') !== undefined) rebases.push(tr.getMeta('rebased')); state = state.apply(tr) } },
     // TipTap's `getJSON` is the *document* node as JSON. `EditorState.toJSON()` would add a `selection`
     // wrapper around it, and a checkpoint uploaded in that shape cannot be read back as a document.
     getJSON: () => state.doc.toJSON(),
+    rebases,
     commands: {
       setContent: (content) => {
         const doc = typeof content === 'string' || !content ? emptyDoc() : schema.nodeFromJSON(content)
@@ -787,6 +791,72 @@ await boundaryCase('our pending insert survives a peer mark at its position',
 // only after the rebuild has already revived its batches. The guard stays because a review reproduced the loss
 // against a driven client, and because an empty `pending` is what authorises the next checkpoint to fold the
 // log, which would turn that loss into shared, permanent loss.
+
+{
+  // Two batches, the first one in flight: the second batch's steps already sit on top of the first, so the
+  // rebuild must not shift that row onto them. Measured before `seen` was inherited at creation: the second
+  // batch walked off the end of the document on revive, the tab halted at v1, and the log was fine.
+  const server = new Sequencer()
+  const hub = new Hub(server)
+  const a = clientScript(hub, server, 'a')
+  hub.join('a', a.client)
+  await settle()
+  typeText(a, '!')
+  await settle()
+  hub.pump((to, frame) => !(to === 'a' && frame.type === 'ACK'))
+  await settle()
+  typeText(a, 'A')
+  typeText(a, 'B')
+  await settle()
+  hub.release()
+  hub.deliverTo('a', { type: 'INIT', onlineCount: 1, ...server.state() })
+  await settle()
+  await drain(hub)
+  await settle()
+  check('a second batch typed while one is in flight survives the rebuild',
+    textOf(a) === '!AB' && jsonOf(a) === replayLog(server) && !a.client.halted && !a.client.hasUnacked
+      && a.client.version === server.version,
+    `"${textOf(a)}", matchesLog ${jsonOf(a) === replayLog(server)}, halted ${a.client.halted}, `
+      + `unacked ${a.client.hasUnacked}, v${a.client.version} of ${server.version}`)
+}
+
+{
+  // The `rebased` meta is a contract with `prosemirror-history`, not with the server, and no document
+  // comparison can check it: `Branch.rebased` pairs the client's stored undo items with the lift inverses by
+  // mirror index, so the value has to be exactly the number of steps the rebase lifted. What this does NOT pin:
+  // a case where the replay drops a lifted step (a peer deleting the content it carried), which is the only
+  // shape that separates `lifted` from `replayed` — asserting the wrong one of those two would still be green
+  // here.
+  const server = new Sequencer()
+  const hub = new Hub(server)
+  const a = clientScript(hub, server, 'a')
+  hub.join('a', a.client)
+  await settle()
+  const peerStep = {
+    stepType: 'replace', from: 1, to: 1,
+    slice: { content: [{ type: 'text', text: 'p' }], size: 1, openStart: 0, openEnd: 0 }
+  }
+  a.setConnected(false)
+  typeText(a, 'a')
+  typeText(a, 'b')
+  typeText(a, 'c')
+  await settle()
+  const lifted = a.client.hasUnacked ? 3 : 0
+  const version = server.commitUnappliable([peerStep], 'peer')
+  hub.deliverTo('a', { type: 'STEPS', clientId: 'peer', version, steps: [peerStep] })
+  await settle()
+  const reported = a.editor.rebases[a.editor.rebases.length - 1]
+  a.setConnected(true)
+  hub.deliverTo('a', { type: 'INIT', onlineCount: 1, ...server.state() })
+  await settle()
+  await drain(hub)
+  await settle()
+  check('the rebase tells the history how many steps it lifted',
+    lifted === 3 && reported === 3 && textOf(a) === 'pabc' && jsonOf(a) === replayLog(server)
+      && !a.client.halted && !a.client.hasUnacked,
+    `reported ${JSON.stringify(a.editor.rebases)}, lifted ${lifted}, text "${textOf(a)}", `
+      + `matchesLog ${jsonOf(a) === replayLog(server)}, unacked ${a.client.hasUnacked}`)
+}
 
 {
   // The case that first exposed the double-mapped fold: two edits typed while offline, then submitted as one

@@ -67,7 +67,7 @@ server contract, and asserts convergence over eight random configurations (405 r
 the scripted orderings that used to be bugs. Its oracle is not "the tabs agree with each other" but "each tab
 equals an independent replay of the operation log", and a run only counts as converged when it needed **no**
 whole-document refetch — otherwise the recovery path passed and the protocol did not. Nothing runs it
-automatically. Exit 0 means all 19 checks are green; the file also carries a known-defect mechanism — a
+automatically. Exit 0 means all 21 checks are green; the file also carries a known-defect mechanism — a
 scenario flagged `expectedToFail` fails the build if it ever passes, so a marker cannot outlive its fix.
 
 Prerequisite: MySQL on `localhost:3306` with `root` and no password. `application.yml` targets
@@ -146,7 +146,11 @@ Each batch still carries `inDocument`: a bootstrap parks the batches whose steps
 and `bootstrapNow` re-applies them onto the rebuilt one, re-deriving their inverses, except those the
 checkpoint has already folded. A parked batch is not liftable, so `rebaseOver` shifts its steps over every
 replayed row that sits above its own `base` instead — revive them verbatim and they land at offsets from a
-document that no longer exists, which is then submitted and becomes everyone's history.
+document that no longer exists, which is then submitted and becomes everyone's history. A batch therefore
+carries a `seen` watermark — the log version its steps are already relative to — and parked steps are shifted
+only over rows above that watermark, because a rebuild replays rows a rebase had already folded in and shifting
+them twice walks the batch off the end of the document (which throws on revive and halts the tab over perfectly
+good history).
 Two cross-layer assumptions hold that up, and neither is enforced by a type: the unicast `ACK` leaves
 `WebSocketObserver` **before** the broadcast, and `catchUp` walks rows in increasing version, so no incoming
 step is ever computed against content this client has committed but not yet acknowledged. Break either one and
@@ -170,7 +174,7 @@ arrive out of order; a version gap is closed by refetching `GET /api/documents/{
 Any error in that chain rebuilds the whole client state from the server — except a history row that cannot
 be applied, which halts instead (see the next paragraph).
 
-`npm run check:collab` is what these choices are tested against: 19 scenarios, all green. The eight random
+`npm run check:collab` is what these choices are tested against: 21 scenarios, all green. The eight random
 configurations additionally fail the run if any client needed a whole-document refetch, so their convergence is
 the protocol's and not the recovery path's; most scripted blocks assert the log replay and the drained queue
 but not the refetch count, and one (the unappliable row) rebuilds on purpose before it halts. What stays open is
@@ -304,12 +308,13 @@ below it are deleted, and `MementoCaretaker` keeps at most 50 snapshots per docu
 reads a snapshot and writes it forward as a new version, broadcasting `RESET`.
 
 Editor-side undo/redo is TipTap/ProseMirror history (`editor.chain().undo()`), which is per user by
-construction — but "unaffected by other people's edits" is only half true, and the other half is an open item.
-`prosemirror-history` needs two things from a collaboration layer to rebase its own stored events: the plugin
-spec must declare `historyPreserveItems: true`, and the transaction that rebases unconfirmed steps must carry
-`setMeta("rebased", n)`. `prosemirror-collab` provides both; `rebaseOver` deliberately does the same mapping
-work but hands over neither, so a local undo after a peer edit can act on pre-rebase offsets. Not covered by
-`npm run check:collab`, which exercises the protocol and never the history stack.
+construction. It is *not* automatically safe across a peer edit: `prosemirror-history` can only rebase its own
+stored steps if it is told a rebase happened, so the collab layer owes it two signals — a plugin in the state
+declaring `historyPreserveItems` (`frontend/src/collab/collabHistory.js`, registered in `DocEditor`'s extension
+list; without it history collapses the items between events and `Branch.rebased`'s mirror walk is meaningless),
+and `setMeta("rebased", n)` on the transaction that lifts and replays local work, where `n` is the number of
+lifted steps and those lifts must be the first `n` steps of the transform. `npm run check:collab` asserts the
+second one; the first is a one-line spec flag whose consumer is upstream.
 
 ## Auth & authorization
 

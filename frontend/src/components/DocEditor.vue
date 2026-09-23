@@ -123,6 +123,7 @@ import wsService from '../services/websocket'
 import notifications from '../services/notifications'
 import { createCollabClient, makeClientId } from '../collab/otClient'
 import { createCursorLayer, refreshCursors } from '../collab/cursorLayer'
+import { createHistoryFlags } from '../collab/collabHistory'
 
 const props = defineProps({
   documentId: String,
@@ -163,8 +164,15 @@ const CursorLayer = Extension.create({
   }
 })
 
+const HistoryFlags = Extension.create({
+  name: 'collabHistoryFlags',
+  addProseMirrorPlugins() {
+    return [createHistoryFlags()]
+  }
+})
+
 const editor = useEditor({
-  extensions: [StarterKit, CursorLayer],
+  extensions: [StarterKit, CursorLayer, HistoryFlags],
   content: '',
   editorProps: {
     handleKeyDown(view, event) {
