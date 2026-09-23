@@ -23,7 +23,7 @@ Backend (run from `backend/`):
 mvn spring-boot:run -Dspring-boot.run.profiles=dev   # http://localhost:8080, schema in collabdoc_dev
 mvn spring-boot:run                                  # default profile, schema in collabdoc
 mvn -o -DskipTests package
-mvn test                                             # 39 tests on in-memory H2, no MySQL needed
+mvn test                                             # 43 tests on in-memory H2, no MySQL needed
 ```
 
 `CollabInvariantTest` and `DocumentSequencerTest` encode *why* the design is correct: the sequence is unique
@@ -134,12 +134,17 @@ map owns delivery — is what keeps multi-instance support from being a special 
   subscribes and delivers locally, and the publishing node takes the same path rather than shortcutting —
   one delivery path, so the origin-session exclusion lives in exactly one place. Membership is
   `collab:doc:{documentId}` → `{sessionId: nodeId}` plus a `collab:node:{nodeId}` lease that a 10s
-  `@Scheduled` heartbeat renews. The tick **adds** this node's live sessions, then **drains** a queue of
-  closings, then renews the lease — each step independently guarded. That order is load-bearing: closing
-  records the removal intent even when its `HDEL` succeeded, because a sweep that snapshotted the session
-  beforehand would otherwise re-add it, and a field owned by a live node is never pruned by anyone.
-  Renewing the lease last and unconditionally matters too — gating it on "every document succeeded" let one
-  poisoned key cost the node its lease and made peers prune every document it holds.
+  `@Scheduled` heartbeat renews. The tick renews the lease **first**, then makes one pass over the documents
+  it holds members in or owes removals for, issuing at most one `HSET` (its live sessions, minus the removal
+  intents it owes) and one varargs `HDEL` (those intents) per document — every call independently guarded.
+  Both details are load-bearing. Closing records the removal intent even when its `HDEL` succeeded, because
+  a sweep that snapshotted the session beforehand would otherwise re-add it and a field owned by a live node
+  is never pruned by anyone. And the pass shares a 5s wall-clock budget — which is why renewal comes first:
+  a stalled Redis costs a read timeout per call, and a node holding ~150 documents would otherwise spend
+  longer between renewals than the 30s lease lasts, watching peers prune members of a live node. Because the
+  budget can cut the pass short, the next tick **starts where this one stopped**; iteration order is stable
+  while the document set holds, so a fixed order would starve the same tail forever, and after a lapsed lease
+  only this sweep can restore this node's own members.
 
 `DocumentSubjectImpl` keeps one observer per document, attached when a session arrives and detached when the
 last one leaves. `notifyAllObservers` also publishes when this node holds **no** viewer: a rename or a
@@ -263,9 +268,12 @@ disappears, the status line reads `Cannot read properties of undefined (reading 
 `applySteps` via `view.dispatch`, and the local batch never lands. What is ruled out: it is not a
 hand-written step shape (the payload was copied from a genuine client batch), and it is not replaying our
 own row in `catchUp` (that double-application was fixed — `catchUp` now stops at `throughVersion` — and
-the crash survives). The remaining suspect is `integrate()`'s mapping when `outstanding` is dropped by a
-`REJECT` while a gap refetch has already advanced `version`. Start by reproducing it in Node against
-`@tiptap/pm` with the two captured payloads, not in the browser.
+the crash survives). What the message actually means: ProseMirror's `Transaction.addStep` assigns
+`this.doc = result.doc`, which is `undefined` when `step.apply(doc)` fails, and the very next thing it does
+is map the selection against that `undefined` doc — so the `TypeError` is a *mask* over "this step does not
+apply to this document". The lead to chase is therefore which step `integrate()` produced (or re-mapped
+twice) for a document that no longer has those offsets, not the selection code. Reproduce in the browser
+(the simplified Node harness with a minimal schema is not trustworthy: it throws on a plain local apply).
 
 ## REST surface
 
@@ -297,8 +305,9 @@ the crash survives). The remaining suspect is `integrate()`'s mapping when `outs
   an exception to an HTTP status; the few remaining `try/catch` blocks only convert a malformed field into
   `IllegalArgumentException`. Do not re-scope the mapping per controller.
   Its catch-all `Exception` handler is why that class also maps Spring MVC's own signals
-  (`NoResourceFoundException`, `HttpRequestMethodNotSupportedException`, `HttpMessageNotReadableException`)
-  — without those, an unknown path or a wrong verb becomes a 500 instead of 404/405.
+  (`NoResourceFoundException`, `HttpRequestMethodNotSupportedException`, `HttpMediaTypeNotSupportedException`,
+  `HttpMessageNotReadableException`, `ErrorResponseException`) — without those, an unknown path or a wrong
+  verb becomes a 500 instead of 404/405/415.
   `MethodArgumentTypeMismatchException` is deliberately in the 400 clause above, not here.
   `@ExceptionHandler` cannot list the `ErrorResponse` interface (not a `Throwable`), so the concrete types
   are enumerated and the status is read per exception. `badRequest` takes `Throwable` because two of its

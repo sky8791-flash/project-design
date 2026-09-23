@@ -20,6 +20,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -46,9 +47,18 @@ class RedisCollabBus implements CollabBus {
     private static final Duration NODE_TTL = Duration.ofSeconds(30);
     // Cannot occur in a session id or a document key, so it splits the two unambiguously.
     private static final char MEMBER_SEPARATOR = '\0';
-    // Bounds the retry work one tick spends, so a poison member cannot starve the ones queued behind it.
-    private static final int MAX_DRAIN_PER_TICK = 32;
-    private static final int MAX_PENDING_REMOVALS = 1_000;
+    // Caps how many documents whose Redis call failed one tick may touch. Counts failures, not attempts, so
+    // a poison key (a wrong-type value at collab:doc:X) cannot push the healthy documents behind it out of
+    // the tick — and {@link #rotation} keeps "behind it" from meaning "forever".
+    private static final int MAX_FAILED_DOCUMENTS_PER_TICK = 8;
+    // An alarm, not a bound: only the failing branch reads the size, so it fires once Redis has been
+    // unreachable long enough for the owed-removal queue to grow, which is exactly when presence stops being
+    // trustworthy. The queue itself cannot be capped — dropping an owed removal recreates the ghost.
+    private static final int PENDING_REMOVALS_LOG_THRESHOLD = 1_000;
+    // Keeps one tick well inside {@link #NODE_TTL}. Each call to a stalled Redis costs the full read timeout,
+    // so without a budget a node holding ~150 documents would spend longer between lease renewals than the
+    // lease lasts and watch peers prune the members of a node that is alive.
+    private static final Duration TICK_BUDGET = Duration.ofSeconds(5);
 
     private final StringRedisTemplate redis;
     private final ObjectMapper objectMapper;
@@ -57,11 +67,16 @@ class RedisCollabBus implements CollabBus {
     /**
      * Closed sessions whose removal the heartbeat still owes. A missed {@code HDEL} is not self-healing the
      * way a missed {@code HSET} is — the sweep only ever adds, and pruning drops only fields of dead nodes,
-     * so a ghost member keeps this node's own live id and inflates {@code onlineCount} for every client on
-     * every document until the process restarts. Closing therefore records the intent first and lets the
-     * drain, which runs after the sweep, be the single authority.
+     * so a ghost member keeps this node's own live id and inflates {@code onlineCount} on that document until
+     * the process restarts. Closing therefore records the intent first and lets the drain be the authority
+     * that clears it, because a tick that snapshotted the session before it closed would otherwise re-add it.
      */
     private final Set<String> pendingRemovals = ConcurrentHashMap.newKeySet();
+    /**
+     * Where in the document list the last tick stopped working, so the next one starts there. Touched only by
+     * the single scheduler thread that runs {@link #membershipHeartbeat()}.
+     */
+    private int rotation;
 
     RedisCollabBus(StringRedisTemplate redis, ObjectMapper objectMapper, LocalDelivery delivery) {
         this.redis = redis;
@@ -116,13 +131,13 @@ class RedisCollabBus implements CollabBus {
         try {
             redis.opsForHash().delete(DOC_SESSIONS + documentId, sessionId);
         } catch (Exception e) {
-            if (pendingRemovals.size() > MAX_PENDING_REMOVALS) {
+            if (pendingRemovals.size() > PENDING_REMOVALS_LOG_THRESHOLD) {
                 log.error("Deferring membership removals for {} sessions; Redis has been unreachable long "
                         + "enough that presence cannot be trusted on this node", pendingRemovals.size());
-                return;
+            } else {
+                log.warn("Could not drop membership for session {} on doc {}, retrying on the next tick: {}",
+                        sessionId, documentId, e.getMessage());
             }
-            log.warn("Could not drop membership for session {} on doc {}; retrying on the next tick",
-                    sessionId, documentId);
         }
     }
 
@@ -176,13 +191,26 @@ class RedisCollabBus implements CollabBus {
     }
 
     /**
-     * Re-asserts this node's membership, drains the removals queued since the last tick, then renews the
-     * lease. Liveness is renewed **independently** of the sweep: gating it on "every document succeeded"
-     * would let one poisoned key cost the whole node its lease, and peers would then prune every document
-     * this node holds — an oscillating, silent presence loss.
+     * Renews the node lease, then gives every document that needs one exactly one {@code HSETALL} and one
+     * {@code HDEL}.
+     *
+     * <p>The lease is renewed <em>first</em> and unconditionally: gating it on "every document succeeded"
+     * would let one poisoned key cost the whole node its lease and have peers prune every document this node
+     * holds, and renewing it last would let the round trips below push the next renewal past
+     * {@link #NODE_TTL}. {@link #TICK_BUDGET} caps the rest so a stalled Redis cannot do that either — and
+     * since the budget can cut the list short, {@link #rotation} starts the next tick where this one stopped.
+     * That is not cosmetic: {@code HashMap} iteration order is stable while the key set holds, so a fixed
+     * order would starve the same tail every tick, and after a lapsed lease only this sweep can put this
+     * node's own members back.</p>
      */
     @Scheduled(fixedRate = 10_000)
-    void renewNodeLease() {
+    void membershipHeartbeat() {
+        try {
+            redis.opsForValue().set(NODE + nodeId, "1", NODE_TTL);
+        } catch (Exception e) {
+            log.warn("Could not renew collab node lease: {}", e.getMessage());
+        }
+
         Map<String, Map<String, String>> byDocument = new HashMap<>();
         try {
             delivery.forEachLiveSession((documentId, sessionId) ->
@@ -190,34 +218,62 @@ class RedisCollabBus implements CollabBus {
         } catch (RuntimeException e) {
             log.warn("Could not snapshot local sessions for the membership tick: {}", e.getMessage());
         }
-        for (Map.Entry<String, Map<String, String>> entry : byDocument.entrySet()) {
-            try {
-                redis.opsForHash().putAll(DOC_SESSIONS + entry.getKey(), entry.getValue());
-            } catch (Exception e) {
-                // One document must not starve the ones after it in iteration order.
-                log.warn("Could not re-assert membership for doc {}: {}", entry.getKey(), e.getMessage());
-            }
-        }
-        int attempted = 0;
+
+        // Fields this node still owes a removal for. The HSETALL must not re-assert them, which is what stops a
+        // tick that snapshotted a session moments before it closed from putting a ghost back; the HDEL in the
+        // same pass clears the intent, and only on success, because a field naming a live node is pruned by
+        // nobody else.
+        Map<String, Set<String>> owed = new HashMap<>();
         for (String member : List.copyOf(pendingRemovals)) {
-            if (attempted++ >= MAX_DRAIN_PER_TICK) break;
             int split = member.indexOf(MEMBER_SEPARATOR);
-            if (split < 0) {
-                pendingRemovals.remove(member);
-                continue;
-            }
-            try {
-                redis.opsForHash().delete(DOC_SESSIONS + member.substring(0, split),
-                        member.substring(split + 1));
-                pendingRemovals.remove(member);
-            } catch (Exception e) {
-                log.warn("Membership removal still pending for {}: {}", member, e.getMessage());
-            }
+            owed.computeIfAbsent(member.substring(0, split), k -> new HashSet<>())
+                    .add(member.substring(split + 1));
         }
-        try {
-            redis.opsForValue().set(NODE + nodeId, "1", NODE_TTL);
-        } catch (Exception e) {
-            log.warn("Could not renew collab node lease: {}", e.getMessage());
+
+        Set<String> documents = new TreeSet<>(byDocument.keySet());
+        documents.addAll(owed.keySet());
+        List<String> order = List.copyOf(documents);
+        long deadline = System.nanoTime() + TICK_BUDGET.toNanos();
+        int visited = 0;
+        int failures = 0;
+        for (int i = 0; i < order.size(); i++) {
+            if (failures >= MAX_FAILED_DOCUMENTS_PER_TICK || System.nanoTime() >= deadline) break;
+            String documentId = order.get((i + rotation) % order.size());
+            visited++;
+            boolean broken = false;
+
+            Map<String, String> members = byDocument.get(documentId);
+            if (members != null) {
+                Set<String> ghosts = owed.get(documentId);
+                if (ghosts != null) members.keySet().removeAll(ghosts);
+                if (!members.isEmpty()) {
+                    try {
+                        redis.opsForHash().putAll(DOC_SESSIONS + documentId, members);
+                    } catch (Exception e) {
+                        broken = true;
+                        log.warn("Could not re-assert membership for doc {}: {}", documentId, e.getMessage());
+                    }
+                }
+            }
+            Set<String> ghosts = owed.get(documentId);
+            // One varargs call for the whole document: an outage that closed sessions across 50 documents
+            // costs 50 round trips, not one per closed session.
+            if (ghosts != null) {
+                try {
+                    redis.opsForHash().delete(DOC_SESSIONS + documentId, ghosts.toArray());
+                    ghosts.forEach(field -> pendingRemovals.remove(documentId + MEMBER_SEPARATOR + field));
+                } catch (Exception e) {
+                    broken = true;
+                    log.warn("Could not drop {} membership field(s) on doc {}, retrying on the next tick: {}",
+                            ghosts.size(), documentId, e.getMessage());
+                }
+            }
+            if (broken) failures++;
+        }
+        rotation = order.isEmpty() ? 0 : (rotation + visited) % order.size();
+        if (visited < order.size()) {
+            log.warn("Membership tick stopped after {} of {} document(s), {} still waiting",
+                    visited, order.size(), order.size() - visited);
         }
     }
 
