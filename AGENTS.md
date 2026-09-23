@@ -405,8 +405,10 @@ tabs as two different users (share it `READ_WRITE` first). Things worth watching
 - `USER_LEFT` arrives **with** `onlineCount` and the number goes down when a tab closes.
 - Typing in both tabs simultaneously: one batch is acked, the other receives `REJECT`, and both tabs
   converge on the same text with no caret jumps. Exercised 2026-09-23 with the recipe above — one browser tab
-  plus one scripted writer, **not** two editors: the tab applied a peer's frame live while its own batch was
-  in flight; a stale-base batch was delivered, came back `REJECT`ed, was rebased and committed; text typed
+  plus one scripted writer, **not** two editors: a peer's frame was made to arrive **before** the tab's own
+  `ACK` — the ack is held back inside the page's socket handler — and the in-flight text survived
+  (`AAABBB`, v2, no error), with the same string rebuilt after a remount; a stale-base batch was delivered,
+  came back `REJECT`ed, was rebased and committed; text typed
   while the socket was down was parked by the reconnect bootstrap and revived exactly once; and remounting the
   editor rebuilt the identical text from `operation_log`. Still untested: a second real editor peer, so nobody
   has watched two ProseMirror views land on the same positions.
