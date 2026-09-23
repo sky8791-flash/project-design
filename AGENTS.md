@@ -148,8 +148,9 @@ map owns delivery — is what keeps multi-instance support from being a special 
   `LocalDelivery.forEachLiveSession` reports **every** registered session with an `open` flag instead of
   filtering closed ones out, precisely because a socket whose `afterConnectionClosed` never ran is never
   announced to `sessionLeft`: registered-minus-open is the only signal that can discover such a ghost, and the
-  registry drops the entry as it reports it so the next tick does not re-drop it. Scope note: this covers a
-  close the container noticed; a half-open socket still reports `isOpen()` true and is re-asserted forever.
+  registry drops the entry as it reports it so the next tick does not re-drop it, and only the redis bus ever
+  calls it. Scope note: this covers a close the container noticed; a half-open socket still reports
+  `isOpen()` true and is re-asserted forever.
 
 `DocumentSubjectImpl` keeps one observer per document, attached when a session arrives and detached when the
 last one leaves. `notifyAllObservers` also publishes when this node holds **no** viewer: a rename or a

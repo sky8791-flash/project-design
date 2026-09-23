@@ -20,6 +20,11 @@ public interface LocalDelivery {
      * Visits every session still registered with this process, reporting whether each one is open, so a bus
      * that tracks membership remotely can re-assert the live ones and discover the ones no close callback
      * ever reached. Skipping a non-open session would hide exactly the member that needs dropping.
+     *
+     * <p>The implementation forgets a session it has reported as closed, so the visit is how the registry
+     * prunes what {@code afterConnectionClosed} never announced — and a visitor must only read, never try to
+     * remove: it is the reporter's decision, and a bus that deletes the entry would leave the member owed by
+     * nobody.</p>
      */
     void forEachLiveSession(SessionVisitor visitor);
 

@@ -111,15 +111,19 @@ public class WebSocketSessionManager implements LocalDelivery {
     public void forEachLiveSession(LocalDelivery.SessionVisitor visitor) {
         documentSessions.forEach((documentId, sessions) ->
                 sessions.forEach((sessionId, session) -> {
+                    // Read isOpen() once: a session reported open and then pruned as closed would be re-asserted
+                    // by the bus *and* forgotten here, which would make its member immortal by this very sweep.
+                    boolean open = session.isOpen();
                     // Report a non-open session rather than skipping it: the membership bus can only drop a
                     // field it is told about, and for these nothing ever tells it — afterConnectionClosed is
                     // the only other remover and it never runs for this state.
-                    visitor.visit(documentId, sessionId, session.isOpen());
-                    if (!session.isOpen()) {
+                    visitor.visit(documentId, sessionId, open);
+                    if (!open) {
+                        // Nothing else removes these, so holding the entry would make every following tick
+                        // rediscover it and repeat a delete that has already landed. The document's own entry
+                        // stays even when empty: dropping it could race a reconnect into the map being removed.
                         sessions.remove(sessionId);
                         sessionOwners.remove(sessionId);
-                        // Two-arg remove: a session registered for the same document in the meantime wins.
-                        if (sessions.isEmpty()) documentSessions.remove(documentId, sessions);
                     }
                 }));
     }

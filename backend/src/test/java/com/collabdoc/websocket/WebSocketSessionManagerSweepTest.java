@@ -33,14 +33,31 @@ class WebSocketSessionManagerSweepTest {
     }
 
     @Test
-    void dropsTheDocumentEntryOnceItsLastSessionIsGone() {
+    void anEmptiedDocumentEntryStillReportsNothingOnceItsGhostIsGone() {
         WebSocketSessionManager registry = new WebSocketSessionManager(new ObjectMapper());
         registry.register("7", session("only", false), 1L);
 
         assertThat(visit(registry)).containsExactly("only:false");
-        // An empty document map left behind would keep the ghost's document in the membership pass forever.
+        // The document's own entry is deliberately left behind even when empty: removing it could race a
+        // reconnect into the map being dropped, orphaning a live session with no log line. It must therefore
+        // contribute nothing to the next pass.
         assertThat(visit(registry)).isEmpty();
         assertThat(registry.localOnlineCount("7")).isZero();
+    }
+
+    @Test
+    void aSessionThatClosesBetweenTheReportAndThePruneIsNotForgotten() {
+        WebSocketSessionManager registry = new WebSocketSessionManager(new ObjectMapper());
+        WebSocketSession flickering = mock(WebSocketSession.class);
+        when(flickering.getId()).thenReturn("s1");
+        when(flickering.isOpen()).thenReturn(true, false);
+        registry.register("7", flickering, 1L);
+
+        assertThat(visit(registry)).containsExactly("s1:true");
+        // It was reported open, so the bus re-asserted it under this node's live lease. Reading the flag a
+        // second time and pruning on that would forget a member no future sweep can reach — the immortal
+        // ghost this whole pass exists to delete. One read per session, one decision.
+        assertThat(visit(registry)).containsExactly("s1:false");
     }
 
     private static List<String> visit(WebSocketSessionManager registry) {
