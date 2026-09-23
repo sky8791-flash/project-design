@@ -319,8 +319,11 @@ stored steps if it is told a rebase happened, so the collab layer owes it two si
 declaring `historyPreserveItems` (`frontend/src/collab/collabHistory.js`, registered in `DocEditor`'s extension
 list; without it history collapses the items between events and `Branch.rebased`'s mirror walk is meaningless),
 and `setMeta("rebased", n)` on the transaction that lifts and replays local work, where `n` is the number of
-lifted steps and those lifts must be the first `n` steps of the transform. `npm run check:collab` asserts the
-second one; the first is a one-line spec flag whose consumer is upstream.
+lifted steps and those lifts must be the first `n` steps of the transform. `npm run check:collab` pins the
+second one's **value**; what is *not* verified anywhere is the behaviour it exists for — a Node attempt to run
+`prosemirror-history`'s `undo` across a peer edit turned out not to discriminate (identical with and without
+both signals, so shipping it would have been a fake green), and a browser check through the real TipTap editor
+is the right place for it. That browser run is still owed.
 
 ## Auth & authorization
 
