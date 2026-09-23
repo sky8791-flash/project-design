@@ -63,12 +63,16 @@ npm run check:collab # convergence harness over the real otClient.js — plain N
 There is no lint or formatter, and no general test runner: `npm run build` is the only automated check over the
 whole frontend and must be run after any edit. `scripts/collab-convergence.mjs` is the exception — it imports
 `src/collab/otClient.js` directly, drives it against an in-process sequencer that implements the documented
-server contract, and asserts convergence over eight random configurations (405 rounds) plus
+server contract, and asserts convergence over eleven random configurations (525 rounds) plus
 the scripted orderings that used to be bugs. Its oracle is not "the tabs agree with each other" but "each tab
-equals an independent replay of the operation log", and a run only counts as converged when it needed **no**
-whole-document refetch — otherwise the recovery path passed and the protocol did not. Nothing runs it
-automatically. Exit 0 means all 23 checks are green; the file also carries a known-defect mechanism — a
-scenario flagged `expectedToFail` fails the build if it ever passes, so a marker cannot outlive its fix.
+equals an independent replay of the operation log" — replayed **from the newest checkpoint over the rows above
+it**, which is the same computation a joining client makes, and after any fold checked a second time against a
+replay of the never-pruned row history, because the checkpoint the first replay starts from is content some
+client uploaded. A run only counts as converged when it needed **no**
+whole-document refetch; closing a version gap over `/operations` is the protocol working and is reported
+separately, because a two-writer run needs those refetches routinely. Nothing runs it
+automatically. Exit 0 means all 27 checks are green; the file also carries two known defects (see below) flagged
+`expectedToFail`, which fails the build if they ever pass, so a marker cannot outlive its fix.
 
 Prerequisite: MySQL on `localhost:3306` with `root` and no password. `application.yml` targets
 database `collabdoc`; `application-dev.yml` overrides only the JDBC URL to `collabdoc_dev` with
@@ -179,14 +183,38 @@ arrive out of order; a version gap is closed by refetching `GET /api/documents/{
 Any error in that chain rebuilds the whole client state from the server — except a history row that cannot
 be applied, which halts instead (see the next paragraph).
 
-`npm run check:collab` is what these choices are tested against: 23 scenarios, all green. The eight random
-configurations additionally fail the run if any client needed a whole-document refetch, so their convergence is
-the protocol's and not the recovery path's; most scripted blocks assert the log replay and the drained queue
-but not the refetch count, and two rebuild on purpose before they halt (the unappliable row, and a
-whole-document write discovered through a version gap). What stays open is the coverage itself: the schema is
-hand-built (`doc/paragraph/text` + `bold/italic`), so `ReplaceAroundStep` — which every real list, blockquote or
-code block produces — never passes through `rebaseOver`, and nothing here exercises the real HTTP or WebSocket
-layer.
+`npm run check:collab` is what these choices are tested against: 27 scenarios green, 2 flagged known defects.
+The random configurations additionally fail if any client needed a whole-document refetch, so their convergence
+is the protocol's and not the recovery path's; the scripted blocks that are about recovery assert the rebuild
+and refetch counts next to the log replay and the drained queue — not every block does — and two rebuild on
+purpose before they halt (the unappliable row, and a
+whole-document write discovered through a version gap). The harness's fake sequencer mirrors
+`DocumentService.recordCheckpoint` rather than being stricter than it: a checkpoint is refused only for a version
+that has not happened, an existing snapshot at that version is not re-captured, the log folds either way, and
+`INIT` hands out the newest snapshot — the earlier fake answered 409 for anything at or below the last
+checkpoint, a rule this server does not have, which meant a stale upload was stopped by a status code that never
+occurs in production instead of by the damage it does.
+
+Coverage now reaches block structure: the schema carries `heading` (with a `level` attribute) and
+`bullet_list`/`list_item`, and the workload can split a block, set a block type and wrap one — so a
+`ReplaceAroundStep` really does reach the log and pass through `rebaseOver`, which is the step type every real
+list, blockquote and code block produces. (`setBlockType` emits a `replaceAround` too; there is no separate step
+type for it in ProseMirror 1.12, and `canonical()` compares node attrs because a heading's `level` is the only
+thing such a step changes — as a rationale, not as coverage: measured by mutation, dropping the attrs from
+`canonical()` leaves all 27 checks green, since no configuration diverges only in an attribute yet.
+`split` is in the workload because a review measured that without it nothing *added*
+a block, so after one wrap no candidate survived and 299 of 300 block rolls declined.) Each run's report prints
+the step types that reached the log, since a coverage claim nothing displays is how this file came to assert
+`ReplaceAroundStep` coverage it did not have.
+
+That is what exposed the two known defects, and they are open: with block edits in the workload a writer ends up
+off the log and then halts refusing the whole-document `replaceAround` row at v17. Delivery order is not the
+trigger — the ordered run fails too — though the two differ in detail (it rebuilds once and stops at v17, the
+last-first run never rebuilds and stops at v16). The scripted counterpart (one unacknowledged insert, one peer
+wrap around the block holding it) converges correctly, which locates it somewhere in a longer chain rather than
+in `ReplaceAroundStep` mapping as such. Cause not established; the previous sentence about `ReplaceAroundStep`
+never being exercised was the reason it stayed invisible, and what is still true is that nothing here exercises
+the real HTTP or WebSocket layer.
 
 Whole-document state is only ever replaced on `INIT`, `RESET`, and the rebuild that any other error triggers, and always with
 `setContent(content, { emitUpdate: false })` — a plain `setContent` would echo the whole document back
@@ -319,8 +347,10 @@ stored steps if it is told a rebase happened, so the collab layer owes it two si
 declaring `historyPreserveItems` (`frontend/src/collab/collabHistory.js`, registered in `DocEditor`'s extension
 list; without it history collapses the items between events and `Branch.rebased`'s mirror walk is meaningless),
 and `setMeta("rebased", n)` on the transaction that lifts and replays local work, where `n` is the number of
-lifted steps and those lifts must be the first `n` steps of the transform. `npm run check:collab` pins the
-second one's **value**; what is *not* verified anywhere is the behaviour it exists for — a Node attempt to run
+lifted steps and those lifts must be the first `n` steps of the transform. `npm run check:collab` pins both
+halves of that — the `rebased` **value**, and the mirror table `Branch.rebased` walks (including the shape that
+separates the steps lifted from the steps replayed, where a peer replaces the content our pending insert sat
+in). What is *not* verified anywhere is the behaviour those signals exist for — a Node attempt to run
 `prosemirror-history`'s `undo` across a peer edit turned out not to discriminate (identical with and without
 both signals, so shipping it would have been a fake green), and a browser check through the real TipTap editor
 is the right place for it. That browser run is still owed.
