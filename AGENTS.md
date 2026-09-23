@@ -83,6 +83,11 @@ service layer (`AdminService.deleteUser` removes the user's documents, shares an
 ⚠️ `document_snapshot` and `operation_log` carry unique `(document_id, version)` constraints. Hibernate
 cannot add those indexes to a table whose existing rows violate them, so pointing a profile at a
 database written by the pre-P0 code fails at startup — dedupe or drop the old rows first.
+Checked read-only against `collabdoc_dev` on 2026-09-23: `uk_oplog_doc_version`, `uk_snapshot_doc_version` and
+`uk_doc_user` all exist, `document` has only its primary key (no secondary index by design), and
+`document.revision`/`document.content_format`/`operation_log.command_params JSON` are present — the live
+database, the entities and `schema.sql` agree, so invariant I5 is enforced by MySQL and not merely unobserved
+to be violated. Nothing outside `collabdoc_dev` was touched; `collabdoc` and `dabashou` hold real data.
 
 Vite proxies `/api` and `/ws`, so the frontend uses relative URLs only; do not hardcode `:8080` in
 `frontend/src/`.
