@@ -1,52 +1,20 @@
-import { ReplaceStep, Step, Mapping } from '@tiptap/pm/transform'
-
-/**
- * `Mapping` with the boundary tie resolved the other way round, for one case only: an incoming *insertion*
- * colliding with our unacknowledged work at the same position.
- *
- * `ReplaceStep.map` asks for `assoc = 1` at its own start, so mapping an insert across another insert at the
- * same position puts it after the one already there. For an incoming step that is the wrong answer: our
- * unacknowledged work has no sequence number yet, so the incoming step is always the earlier of the two and has
- * to land first. Mapping both directions with the default tie-break is what let two clients typing at the same
- * spot reach the same version with different text — "abXY" on one, "abYX" on the other, with the log saying
- * "abXY".
- */
-class TheirsFirst extends Mapping {
-  mapResult(pos) {
-    return super.mapResult(pos, -1)
-  }
-}
-
-/**
- * Which mapping one incoming step should travel through. An incoming *insertion* — a zero-width range with
- * content to put in it — takes the reversed tie-break; everything else keeps the default, because on a step
- * that spans a range the two ends are asked for different associations deliberately (`from` with `1`, `to` with
- * `-1`), and forcing both to `-1` widens the incoming range across our own unacknowledged text: a peer deleting
- * one character next to our pending insert then deletes the inserted character too, on this client only, and
- * the next checkpoint this tab uploads folds that loss into everybody's history. Upstream made the same
- * distinction when it added `ReplaceStep.MAP_BIAS`, which applies only when `from == to`; the global flag
- * cannot be used here anyway, because it would flip the ours-over-theirs direction too, and ours has to stay
- * "after".
- */
-const incomingMapping = (step, unackedMaps) =>
-  step instanceof ReplaceStep && step.from === step.to && step.slice.size > 0
-    ? new TheirsFirst(unackedMaps)
-    : new Mapping(unackedMaps)
+import { Mapping, Step } from '@tiptap/pm/transform'
 
 /**
  * Client half of the collaboration protocol. The server only orders step batches, so every
  * convergence guarantee lives here.
  *
- * The invariant most of this file exists to keep: every batch in `pending` carries `inDocument`, saying
- * whether its steps are actually in this document right now. Incoming steps are mapped only over the ones
- * that are, because those are the positions this document really has; the others — parked by a bootstrap, or
- * typed while one awaited the network — are mapped *over* the incoming steps so they stay applicable, never
- * the reverse way round.
+ * The invariant most of this file exists to keep: every step in `pending` carries the inverse of itself, so an
+ * incoming batch can be applied by *rebasing* — lift our unacknowledged work out, apply theirs exactly as the
+ * log has it, replay ours on top. Mapping in both directions was tried and is wrong: a batch's steps are
+ * successive relative to one another, so one accumulated mapping shifts them twice, and a same-position tie
+ * broke in opposite orders on the two clients. `inDocument` still distinguishes the batches whose steps are in
+ * this document right now from the ones a bootstrap parked; parked steps are replayed, never lifted.
  *
  * Other rules that are not optional:
  * - local steps join `pending` **synchronously** (ProseMirror has already applied them); only the send is
  *   serialized onto the promise chain, otherwise steps typed during an awaited fetch would be invisible to
- *   `integrate()` and incoming steps would land at the wrong offsets;
+ *   `rebaseOver` and incoming steps would land at the wrong offsets;
  * - at most one batch is outstanding, so acknowledgement bookkeeping stays trivial; later local steps append to
  *   the unsent batch unchanged, because ProseMirror already applied them on top of it;
  * - frames are processed through one serialized chain because the server fans frames out after commit, so
@@ -89,58 +57,100 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     return tail
   }
 
-  const unackedSteps = () =>
-    pending.filter((batch) => batch.inDocument).flatMap((batch) => batch.steps)
+  const unackedEntries = () =>
+    pending.filter((batch) => batch.inDocument).flatMap((batch) => batch.entries)
 
   /**
-   * A step that maps to nothing had its target removed by an unacknowledged delete, so no part of its effect
-   * survives: dropping it is right on both sides of the mapping. `what` only labels the log line — a run of
-   * these is what a real divergence looks like from inside this client, and refusing to apply the incoming
-   * steps instead would trade one lost range for a tab that never catches up again.
+   * The inverse of a step is only meaningful against the document it was applied to, and ProseMirror keeps
+   * exactly that in `tr.docs[i]` — which is why local capture receives the transaction, not just its steps.
    */
-  const mapWith = (steps, mapping, what) => {
-    const mapped = steps.map((step) => step.map(mapping)).filter(Boolean)
-    if (what && mapped.length !== steps.length) {
-      console.warn(`collab: ${steps.length - mapped.length} ${what} step(s) were deleted out from under us`)
-    }
-    return mapped
-  }
+  const entriesFrom = (tr, batch) =>
+    tr.steps.map((step, index) => ({ step, inverted: step.invert(tr.docs[index]), batch }))
 
   const stepsFrom = (raw) => {
     const schema = editor.state.schema
     return raw.map((json) => Step.fromJSON(schema, json))
   }
 
+  const remoteMetas = (tr) => {
+    tr.setMeta('addToHistory', false)
+    tr.setMeta('remote', true)
+    return tr
+  }
+
   const applySteps = (steps) => {
     if (!steps.length) return
-    const tr = editor.state.tr
+    const tr = remoteMetas(editor.state.tr)
     // `step`, not `addStep`: in this ProseMirror version `addStep(step, doc)` is the internal half that
     // stores the document the *caller* computed, so calling it with one argument sets the transaction's doc
     // to undefined and the very next thing ProseMirror does is resolve the selection against it.
     steps.forEach((step) => tr.step(step))
-    tr.setMeta('addToHistory', false)
-    tr.setMeta('remote', true)
     editor.view.dispatch(tr)
   }
 
   /**
-   * Interleaves one incoming batch with our unacknowledged steps: theirs mapped over what is in this
-   * document so it lands here, ours mapped over theirs so they stay sendable against the server's order.
-   * Both directions are required; what decides convergence is the *tie-break* — see `TheirsFirst`.
+   * Lifts our unacknowledged steps out of the document, applies the incoming ones as the log has them, then
+   * replays ours on top. Ported from `prosemirror-collab`'s `rebaseSteps`.
+   *
+   * Mapping in both directions cannot express this, which is what the last two defects were. Each side's steps
+   * are successive relative to themselves, so mapping an incoming step through *all* of our accumulated maps
+   * puts it on the wrong base, and a same-position tie then breaks differently on the two clients — the log
+   * said `X@3` then `Y@4`, one tab showed `abXY` and the other `abYX`, both at the same version with nothing
+   * halted. Replaying ours through `mapping.slice(mapFrom)` with the mirror set is what keeps the order the
+   * server chose: ours goes after theirs, always, because ours has no sequence number yet.
+   *
+   * A lift that throws or a replay that no longer applies is a step whose content another writer removed;
+   * `maybeStep` drops it, matching upstream. The incoming steps are applied with `step`, so an unappliable
+   * history row still reaches `haltAt` rather than being skipped.
    */
-  const integrate = (incomingSteps) => {
-    const unackedMaps = unackedSteps().map((step) => step.getMap())
-    const applicable = incomingSteps.flatMap(
-      (step) => mapWith([step], incomingMapping(step, unackedMaps), 'incoming'))
+  const rebaseOver = (incoming, atVersion = null) => {
+    const overTheirs = new Mapping(incoming.map((step) => step.getMap()))
 
-    const overTheirs = new Mapping(incomingSteps.map((step) => step.getMap()))
+    // A parked batch's steps are expressed against the version it was built on, so everything the replay
+    // applies above that version has to shift them as well. Revive them verbatim and they land at offsets from
+    // a document that no longer exists — consistent with the log, and wrong in it, because the stale offset is
+    // what gets submitted next.
+    if (atVersion !== null) {
+      pending.forEach((batch) => {
+        if (batch.inDocument || batch.base >= atVersion) return
+        batch.entries = batch.entries.flatMap((entry) => {
+          const mapped = entry.step.map(overTheirs)
+          return mapped ? [{ step: mapped, inverted: entry.inverted, batch }] : []
+        })
+      })
+    }
+
+    const ours = unackedEntries()
+    if (!ours.length) {
+      applySteps(incoming)
+      return
+    }
+
+    const tr = remoteMetas(editor.state.tr)
+    for (let index = ours.length - 1; index >= 0; index -= 1) tr.step(ours[index].inverted)
+    incoming.forEach((step) => tr.step(step))
+
+    const replayed = []
+    for (let index = 0, mapFrom = ours.length; index < ours.length; index++) {
+      const mapped = ours[index].step.map(tr.mapping.slice(mapFrom))
+      mapFrom--
+      if (!mapped) continue
+      const before = tr.doc
+      if (tr.maybeStep(mapped).failed) continue
+      tr.mapping.setMirror(mapFrom, tr.steps.length - 1)
+      replayed.push({ step: mapped, inverted: mapped.invert(before), batch: ours[index].batch })
+    }
+
+    // Only the batches that were lifted get a new entry list. A parked one is not in the document, was never
+    // lifted, and is still waiting for `bootstrapNow` to revive it — overwriting its entries here would delete
+    // the user's offline typing without a trace, and then fold that into everyone's history at the next
+    // checkpoint, because an empty `pending` is what lets a checkpoint go out at all.
     pending.forEach((batch) => {
-      batch.steps = mapWith(batch.steps, overTheirs)
+      if (batch.inDocument) batch.entries = replayed.filter((entry) => entry.batch === batch)
     })
-    pending = pending.filter((batch) => batch.steps.length)
-    if (outstanding && !outstanding.steps.length) outstanding = null
-
-    return applicable
+    pending = pending.filter((batch) => !batch.inDocument || batch.entries.length)
+    if (outstanding && outstanding.inDocument && !outstanding.entries.length) outstanding = null
+    editor.view.dispatch(tr)
   }
 
   const sendBatch = (batch) => {
@@ -151,7 +161,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
       clientId,
       baseVersion: batch.base,
       docSize: editor.state.doc.content.size,
-      steps: batch.steps.map((step) => step.toJSON())
+      steps: batch.entries.map((entry) => entry.step.toJSON())
     })
   }
 
@@ -165,20 +175,26 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     }
   }
 
-  /** Called with the steps of a local transaction, after ProseMirror has already applied them. */
-  const addLocalSteps = (steps) => {
-    if (!steps.length) return
-
-    const last = pending[pending.length - 1]
-    if (last && !last.sent && last.inDocument && last.base === version) {
-      // Append, do not re-map. The caller's steps are already successive — ProseMirror applied them to a
-      // document that contains every step before them — so mapping the new step through the accumulated maps
-      // of the steps it follows shifts it twice and stores a batch that no longer replays. That is not a
-      // cosmetic problem: the batch that goes out is what every other reader replays.
-      last.steps = last.steps.concat(steps)
-    } else {
-      pending.push({ base: version, steps: [...steps], sent: false, inDocument: true })
-    }
+  /**
+   * Called with every transaction a local edit produced, after ProseMirror has applied them. TipTap hands the
+   * root transaction and the `appendTransaction` output separately, and StarterKit's trailing paragraph is one
+   * of the appended ones — a step that reaches the document but not this batch is content no peer will ever
+   * receive, and the next lift will throw because `pending` does not know to undo it.
+   *
+   * Steps enter `pending` **synchronously** and append unchanged: each is already successive, because it was
+   * applied on top of the ones before it.
+   */
+  const addLocalSteps = (transactions) => {
+    transactions.filter((tr) => tr.steps.length).forEach((tr) => {
+      const last = pending[pending.length - 1]
+      if (last && !last.sent && last.inDocument && last.base === version) {
+        last.entries = last.entries.concat(entriesFrom(tr, last))
+      } else {
+        const batch = { base: version, entries: [], sent: false, inDocument: true }
+        batch.entries = entriesFrom(tr, batch)
+        pending.push(batch)
+      }
+    })
     enqueue(async () => flush())
   }
 
@@ -253,9 +269,9 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
           // Our own row is still somebody else's batch as far as this document is concerned: the user may have
           // typed while the network call was in flight, and replaying the row at its original offsets would
           // land it inside that work instead of beside it.
-          if (replayOwn) applySteps(integrate(steps))
+          if (replayOwn) rebaseOver(steps, log.version)
         } else {
-          applySteps(integrate(steps))
+          rebaseOver(steps, log.version)
         }
       } catch (error) {
         haltAt(log.version, error)
@@ -284,7 +300,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
       if (frame.clientId === clientId) {
         acknowledge(seq)
       } else {
-        applySteps(integrate(stepsFrom(frame.steps || [])))
+        rebaseOver(stepsFrom(frame.steps || []), seq)
       }
       // Never lower it: a bootstrap nested inside that catchUp may already have adopted a newer version
       // than the frame we are finishing, and downgrading would make the next replay re-apply rows that are
@@ -324,12 +340,13 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
       const rejected = outstanding
       rejected.sent = false
       outstanding = null
-      // It stays at the head of `pending` while we catch up, so integrate() re-maps its steps over the
-      // operations we are about to apply; sending it at its old offsets would corrupt the document.
+      // It stays at the head of `pending` while we catch up, so the rebase inside `catchUp` keeps its steps
+      // aligned with the operations we are about to apply; sending it at its old offsets would corrupt the
+      // document.
       await catchUp(frame.version)
       if (haltedAt !== null) return
       rejected.base = version
-      if (!rejected.steps.length) pending = pending.filter((batch) => batch !== rejected)
+      if (!rejected.entries.length) pending = pending.filter((batch) => batch !== rejected)
       emit('version', version)
       flush()
     })
@@ -365,11 +382,21 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     emit('version', version)
   }
 
+  /** Re-applies parked steps to a rebuilt document and re-derives their inverses against the new one. */
+  const applyEntries = (steps, batch) => {
+    if (!steps.length) return []
+    const tr = remoteMetas(editor.state.tr)
+    steps.forEach((step) => tr.step(step))
+    const entries = entriesFrom(tr, batch)
+    editor.view.dispatch(tr)
+    return entries
+  }
+
   const bootstrapNow = async (state) => {
     // The document is about to be replaced, so none of our batches are in it any more — but they stay in
-    // `pending`, because `integrate()` still has to re-map their steps over everything the replay applies.
-    // Anything typed during this function is the exception: ProseMirror applies it to the new document
-    // straight away, so it keeps `inDocument` and must not be applied twice by the loop below.
+    // `pending`, because `rebaseOver` still has to lift their steps out and replay them over everything the
+    // rebuild applies. Anything typed during this function is the exception: ProseMirror applies it to the new
+    // document straight away, so it keeps `inDocument` and must not be applied twice by the loop below.
     pending.forEach((batch) => { batch.inDocument = false })
     checkpointDue = false
 
@@ -391,18 +418,26 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     const rebuiltFrom = state.checkpointVersion ?? state.version
     const folded = (batch) => batch.sent && batch.base + 1 <= rebuiltFrom
     const waiting = pending.filter((batch) =>
-      !batch.inDocument && !folded(batch) && batch.steps.length)
+      !batch.inDocument && !folded(batch) && batch.entries.length)
     // Keep whatever became `inDocument` while the replay was in flight — the user went on typing — and drop
     // everything else from the list before re-adding the revived batches on top.
     pending = pending.filter((batch) => batch.inDocument)
     outstanding = null
-    waiting.forEach((batch) => {
-      applySteps(batch.steps)
+    for (const batch of waiting) {
+      try {
+        batch.entries = applyEntries(batch.entries.map((entry) => entry.step), batch)
+      } catch (error) {
+        // Our own parked work no longer applies to the document the rebuild produced. That is the same dead
+        // end as an unappliable history row, and it gets the same treatment: stop, rather than loop through
+        // another rebuild that will fail the same way.
+        haltAt(version, error)
+        return
+      }
       batch.inDocument = true
       batch.sent = false
       batch.base = version
       pending.push(batch)
-    })
+    }
 
     emit('version', version)
     flush()

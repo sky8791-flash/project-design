@@ -63,12 +63,12 @@ npm run check:collab # convergence harness over the real otClient.js — plain N
 There is no lint or formatter, and no general test runner: `npm run build` is the only automated check over the
 whole frontend and must be run after any edit. `scripts/collab-convergence.mjs` is the exception — it imports
 `src/collab/otClient.js` directly, drives it against an in-process sequencer that implements the documented
-server contract, and asserts convergence over seven random configurations (~345 rounds, ~1000 local edits) plus
+server contract, and asserts convergence over eight random configurations (405 rounds) plus
 the scripted orderings that used to be bugs. Its oracle is not "the tabs agree with each other" but "each tab
 equals an independent replay of the operation log", and a run only counts as converged when it needed **no**
 whole-document refetch — otherwise the recovery path passed and the protocol did not. Nothing runs it
-automatically. Exit 0 means 14 checks green; it also prints four KNOWN scenarios, listed below, that are
-recorded rather than fixed.
+automatically. Exit 0 means all 19 checks are green; the file also carries a known-defect mechanism — a
+scenario flagged `expectedToFail` fails the build if it ever passes, so a marker cannot outlive its fix.
 
 Prerequisite: MySQL on `localhost:3306` with `root` and no password. `application.yml` targets
 database `collabdoc`; `application-dev.yml` overrides only the JDBC URL to `collabdoc_dev` with
@@ -126,56 +126,57 @@ command object had nothing to act on. Do not reintroduce them; the reasoning is 
 
 ### Client side (`frontend/src/collab/otClient.js`)
 
-Convergence lives here. At most one batch is outstanding; later local steps **append unchanged** to the unsent
-batch — they are already successive, because ProseMirror applied them on top of it, and re-mapping them through
-the batch's own accumulated `Mapping` shifts them twice and stores a history that no longer replays (that was
-the defect behind the folded-batch entry below). Each batch carries `inDocument`: incoming steps are mapped only over batches
-whose steps really are in this document, while *all* pending batches (including the ones parked for a
-replay) are mapped over the incoming ones so they stay sendable — mapping incoming steps over parked ones
-would push them past text that is not there yet, and that asymmetry is the point of `bootstrapNow`'s
-park/revive step. Commit bookkeeping is per batch, never per client: the server commits an accepted batch at
+Convergence lives here, and it is a **rebase**, ported from `prosemirror-collab`: lift our unacknowledged steps
+out of the document using the inverse each one carries, apply the incoming steps exactly as the log has them,
+then replay ours on top through `mapping.slice(mapFrom)` with the mirror set. Every step in `pending` therefore
+stores its own inverse, computed against `tr.docs[i]` at capture time — which is why `addLocalSteps` takes the
+transaction, not its steps.
+
+Mapping in both directions is what that replaced, and it was not repairable by tuning: a batch's steps are
+successive relative to one another, so one accumulated mapping shifts them twice. Two writers at one position
+reached the same version with `abXY` on one tab and `abYX` on the other (log `X@3` then `Y@4`), and a folded
+multi-step batch could submit a step that does not apply to the document the server sequenced it against —
+which makes the operation log itself unreplayable for every reader, the same terminal condition as a
+deliberately poisoned row, produced by honest clients with no attacker. An intermediate attempt that kept the
+double mapping and forced `assoc = -1` for incoming insertions fixed the visible tie and quietly widened peer
+deletes and marks across the local user's uncommitted character instead; that is also why upstream's
+`ReplaceStep.MAP_BIAS` is gated on `from == to`. No trace of that approach is left in the code.
+
+Each batch still carries `inDocument`: a bootstrap parks the batches whose steps are no longer in the document
+and `bootstrapNow` re-applies them onto the rebuilt one, re-deriving their inverses, except those the
+checkpoint has already folded. A parked batch is not liftable, so `rebaseOver` shifts its steps over every
+replayed row that sits above its own `base` instead — revive them verbatim and they land at offsets from a
+document that no longer exists, which is then submitted and becomes everyone's history.
+Two cross-layer assumptions hold that up, and neither is enforced by a type: the unicast `ACK` leaves
+`WebSocketObserver` **before** the broadcast, and `catchUp` walks rows in increasing version, so no incoming
+step is ever computed against content this client has committed but not yet acknowledged. Break either one and
+the lift starts seeing steps it did not record.
+A step that can no longer be replayed on the way back in is dropped, as upstream does; the
+incoming steps go through `tr.step`, so an unappliable *history row* still throws and reaches `haltAt` rather
+than being skipped.
+
+`DocEditor.vue`'s `onUpdate` submits the root transaction **and** TipTap's `appendedTransactions`, because
+StarterKit's trailing-node plugin adds its paragraph that way — a document change that never enters `pending`
+is content no peer receives, and the next rebase throws because there is nothing to lift. Appends of a
+*remote* transaction are deliberately not submitted: every tab runs the same plugin locally, so submitting
+them would multiply trailing paragraphs across the group. That is a judgement call about plugin-generated
+state, not a proven-safe one — it is untested beyond the harness, and the harness schema cannot produce those
+plugins at all. Commit bookkeeping is per batch, never per client: the server commits an accepted batch at
 exactly `base + 1`, so `acknowledge(version)` releases only the batch carrying that version — a "we saw one
 of our own rows" flag spans everything above the checkpoint (up to `CHECKPOINT_EVERY` versions of older
-work) and loses or duplicates the batch the user is waiting on. A step that maps to nothing is dropped on
-both sides of the mapping — that is the correct OT answer when an unacknowledged delete took its target — and
-the incoming side logs it, because refusing to apply incoming steps instead would trade one lost range for a
-tab that never catches up. Frames are handled through one
+work) and loses or duplicates the batch the user is waiting on. Frames are handled through one
 serialized promise chain because the server fans frames out after commit, so two writers' frames can
 arrive out of order; a version gap is closed by refetching `GET /api/documents/{id}/operations?after=`.
 Any error in that chain rebuilds the whole client state from the server — except a history row that cannot
 be applied, which halts instead (see the next paragraph).
 
-**Mapping in both directions is not enough by itself: the tie has to break the same way on both sides.**
-`ReplaceStep.map` asks for `assoc = 1` at its own start, so an incoming insert landing at the position where a
-local unacknowledged insert already sits goes *after* it — and the same pair viewed from the other client also
-maps to "after", so the two documents end up with the two characters swapped. `incomingMapping` therefore sends
-an incoming **insertion** through `TheirsFirst`, a `Mapping` that forces `assoc = -1`, and everything else
-through a plain `Mapping`. The gate is load-bearing, not tidiness: an earlier unqualified version of this rule
-flipped the association of a range's `from` as well, which widens an incoming delete or mark across the
-character the local user has typed but not yet had committed. Reproduced before the fix: log `X@3` then `Y@4`,
-the server and one tab showing `abXY`, the other tab `abYX`, both at v4 with a drained queue and no halt — the
-version agreed and the content did not. Upstream added `ReplaceStep.MAP_BIAS` for the same tie and gates it on
-`from == to`; that flag cannot be used here because it is process-global and would flip the ours-over-theirs
-direction too, which must stay "after".
-
-Four KNOWN scenarios, reproduced by `npm run check:collab`, none of them fixed — in two families:
-
-1. **A concurrent multi-step batch can corrupt the history.** Several clients typing in bursts produce batches
-   of three to five steps, and the submitted steps can then include one that does not apply to the document the
-   server sequenced it against — the replay fails with `Invalid content for node doc`, i.e. inline content
-   pushed out of its textblock. That breaks the operation log itself, the same terminal condition this file
-   documents for a deliberately poisoned row, except produced by honest clients with no attacker involved. A
-   single writer bursting six edits is now clean, which localises it: the fold in `addLocalSteps` was the first
-   offender (it re-mapped already-successive steps and is fixed), and what remains is `integrate()`'s
-   ours-over-theirs re-mapping, which applies one static incoming `Mapping` to a chain whose members are
-   successive relative to each other. Every configuration with one step per batch converges, and so does every
-   single-writer one.
-2. **Our unacknowledged insert is lost across a reconnect.** With our insert in the document and unacknowledged,
-   a peer's delete (or mark) at that position leaves this tab matching the log — but the log never received the
-   character, and the replay after the reconnect throws `RangeError: Position 8 out of range`. The tab's document
-   is consistent; the user's typing is gone. Whether the trigger is `bootstrapNow`'s revival or the scenario's
-   hand-committed row is open, so do not call this one a product defect until a run through the real server
-   reproduces it.
+`npm run check:collab` is what these choices are tested against: 19 scenarios, all green. The eight random
+configurations additionally fail the run if any client needed a whole-document refetch, so their convergence is
+the protocol's and not the recovery path's; most scripted blocks assert the log replay and the drained queue
+but not the refetch count, and one (the unappliable row) rebuilds on purpose before it halts. What stays open is
+the coverage itself: the schema is hand-built
+(`doc/paragraph/text` + `bold/italic`), so `ReplaceAroundStep` — which every real list, blockquote or code block
+produces — never passes through `rebaseOver`, and nothing here exercises the real HTTP or WebSocket layer.
 
 Whole-document state is only ever replaced on `INIT`, `RESET`, and the rebuild that any other error triggers, and always with
 `setContent(content, { emitUpdate: false })` — a plain `setContent` would echo the whole document back
@@ -303,7 +304,12 @@ below it are deleted, and `MementoCaretaker` keeps at most 50 snapshots per docu
 reads a snapshot and writes it forward as a new version, broadcasting `RESET`.
 
 Editor-side undo/redo is TipTap/ProseMirror history (`editor.chain().undo()`), which is per user by
-construction and unaffected by other people's edits.
+construction — but "unaffected by other people's edits" is only half true, and the other half is an open item.
+`prosemirror-history` needs two things from a collaboration layer to rebase its own stored events: the plugin
+spec must declare `historyPreserveItems: true`, and the transaction that rebases unconfirmed steps must carry
+`setMeta("rebased", n)`. `prosemirror-collab` provides both; `rebaseOver` deliberately does the same mapping
+work but hands over neither, so a local undo after a peer edit can act on pre-rebase offsets. Not covered by
+`npm run check:collab`, which exercises the protocol and never the history stack.
 
 ## Auth & authorization
 

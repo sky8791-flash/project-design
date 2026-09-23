@@ -181,9 +181,17 @@ const editor = useEditor({
       return false
     }
   },
-  onUpdate: ({ editor, transaction }) => {
-    if (transaction.getMeta('remote')) return
-    if (transaction.steps.length) collab.value?.addLocalSteps([...transaction.steps])
+  onUpdate: ({ editor, transaction, appendedTransactions = [] }) => {
+    // TipTap reports the root transaction and the `appendTransaction` output separately, and StarterKit's
+    // trailing paragraph is one of the appended ones. A document change that never enters the batch is content
+    // no peer will ever receive, and the next rebase will throw because `pending` cannot lift it.
+    // Appends of a *remote* transaction are deliberately not submitted — see the plugin-generated-state note in
+    // AGENTS.md; every tab runs the same plugin locally, so submitting them would multiply them.
+    if (transaction.getMeta('remote')) {
+      refreshHistoryFlags(editor)
+      return
+    }
+    collab.value?.addLocalSteps([transaction, ...appendedTransactions])
     refreshHistoryFlags(editor)
     sendCursorPosition(editor.state.selection.from)
   },

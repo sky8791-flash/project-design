@@ -4,7 +4,7 @@
  *     npm run check:collab
  *
  * Invariant I2 in the plan says two clients that have seen the same sequence prefix hold the same document.
- * The server-side half of that is covered by `CollabInvariantTest`, but `integrate()` — the rebase that makes
+ * The server-side half of that is covered by `CollabInvariantTest`, but `rebaseOver()` — the rebase that makes
  * convergence happen — lives in `otClient.js` and had no executable check, only a handful of browser
  * observations. This drives the real client against a sequencer that implements the documented contract
  * (`baseVersion` must equal the current version, an accepted batch commits at exactly `base + 1`, `ACK` and
@@ -85,7 +85,7 @@ const localEdit = (editor, client, random, { deletes = true, marks = true } = {}
 
   const commit = (tr, inserted = null) => {
     editor.view.dispatch(tr)
-    client.addLocalSteps(tr.steps)
+    client.addLocalSteps([tr])
     return { inserted }
   }
 
@@ -338,7 +338,7 @@ const typeText = (side, text) => {
 const insertAt = (side, text, at) => {
   const tr = side.editor.state.tr.insertText(text, at)
   side.editor.view.dispatch(tr)
-  side.client.addLocalSteps(tr.steps)
+  side.client.addLocalSteps([tr])
   return text
 }
 
@@ -532,14 +532,14 @@ await assertConverged('random: three writers, frames delivered last-first', () =
   }))
 await assertConverged('random: four writers, insert plus mark plus delete workload', () =>
   runRandomRounds({ seed: RANDOM_SEED + 4, writers: 4, rounds: 40, options: { deletes: true } }))
-// One writer, so `integrate()` never runs: whatever this configuration breaks on belongs to the fold in
+// One writer, so `rebaseOver()` never runs: whatever this configuration breaks on belongs to the fold in
 // `addLocalSteps` and to no one else.
 await assertConverged('random: one writer, six edits per round (the fold alone, no peer)', () =>
   runRandomRounds({ seed: RANDOM_SEED + 7, writers: 1, rounds: 60, burst: 6, options: { deletes: true } }))
-// Multi-step batches, flagged as failing: a burst makes a client submit a step that cannot be applied to the
-// document the server sequenced it against, which breaks the history for every reader. The cause is not fixed.
+// Multi-step batches: several local edits folded into one batch, arriving while a peer's work is in flight.
+// These are the configurations that found the double-mapping defects, so they carry the most weight here.
 await assertConverged('random: three writers, three edits per round (multi-step batches)', () =>
-  runRandomRounds({ seed: RANDOM_SEED + 5, writers: 3, rounds: 40, burst: 3, options: { deletes: true } }), true)
+  runRandomRounds({ seed: RANDOM_SEED + 5, writers: 3, rounds: 40, burst: 3, options: { deletes: true } }))
 await assertConverged('random: two writers, five edits per round, frames reversed (multi-step batches)', () =>
   runRandomRounds({
     seed: RANDOM_SEED + 6,
@@ -548,7 +548,7 @@ await assertConverged('random: two writers, five edits per round, frames reverse
     burst: 5,
     options: { deletes: true },
     reorder: (frames) => frames.slice().reverse()
-  }), true)
+  }))
 
 // --- the specific orderings that used to be bugs -----------------------------
 
@@ -602,6 +602,33 @@ await boundaryCase('our pending insert survives a peer delete at its position',
   new ReplaceStep(4, 5, Slice.empty), 'abcX')
 await boundaryCase('our pending insert survives a peer mark at its position',
   new AddMarkStep(4, 5, schema.marks.bold.create()), 'abcXd')
+
+{
+  // The case that started it: two writers, one position, both characters unacknowledged at the same time. The
+  // old code reached the same version with `abXY` on one tab and `abYX` on the other.
+  const server = new Sequencer()
+  const hub = new Hub(server)
+  const a = clientScript(hub, server, 'a')
+  const b = clientScript(hub, server, 'b')
+  hub.join('a', a.client)
+  hub.join('b', b.client)
+  await settle()
+  typeText(a, 'ab')
+  await settle()
+  await drain(hub)
+  typeText(a, 'X')
+  typeText(b, 'Y')
+  await settle()
+  await drain(hub)
+  await settle()
+  check('two writers typing at one position converge on the log order',
+    jsonOf(a) === jsonOf(b) && jsonOf(a) === replayLog(server) && textOf(a) === 'abXY'
+      && a.client.version === server.version && b.client.version === server.version
+      && !a.client.hasUnacked && !b.client.hasUnacked && a.stats.rebuilds === 0 && b.stats.rebuilds === 0,
+    `a "${textOf(a)}", b "${textOf(b)}", v${a.client.version}/${b.client.version} of ${server.version}, `
+      + `matchesLog ${jsonOf(a) === replayLog(server)}, `
+      + `rebuilds ${a.stats.rebuilds}/${b.stats.rebuilds}`)
+}
 
 {
   // A late ACK: the peer's steps force a rebase before the sender ever learns its own batch committed.
@@ -754,8 +781,16 @@ await boundaryCase('our pending insert survives a peer mark at its position',
     `halted before ${haltedBefore}, halted now ${a.client.halted}, v${a.client.version} of ${server.version}`)
 }
 
+// The `batch.inDocument` guard in `rebaseOver` — the one that stops a batch parked by a rebuild from being
+// wiped by the rebase that follows it — is deliberately not claimed as covered here. Reaching it needs a
+// keystroke inside the rebuild's `/operations` fetch, and the serialized frame chain runs any incoming frame
+// only after the rebuild has already revived its batches. The guard stays because a review reproduced the loss
+// against a driven client, and because an empty `pending` is what authorises the next checkpoint to fold the
+// log, which would turn that loss into shared, permanent loss.
+
 {
-  // The queue must not drop edits typed while the socket is down, nor send them while it is.
+  // The case that first exposed the double-mapped fold: two edits typed while offline, then submitted as one
+  // batch. It has to be a batch the server can replay, not merely one whose version lines up.
   const server = new Sequencer()
   const hub = new Hub(server)
   const a = clientScript(hub, server, 'a')
@@ -763,17 +798,20 @@ await boundaryCase('our pending insert survives a peer mark at its position',
   await settle()
   const random = randomFor(83)
   a.setConnected(false)
-  typeText(a, 'f')
+  localEdit(a.editor, a.client, random, { deletes: false })
+  localEdit(a.editor, a.client, random, { deletes: false })
   await settle()
   const queuedWhileDown = server.version
   a.setConnected(true)
-  typeText(a, 'j')
+  hub.deliverTo('a', { type: 'INIT', onlineCount: 1, ...server.state() })
   await settle()
   await drain(hub)
   await settle()
-  check('typing while disconnected is folded into one batch, not lost and not sent twice',
-    queuedWhileDown === 0 && server.version === 1 && textOf(a).length === 2 && !a.client.hasUnacked,
-    `server at v${server.version} for two edits, text "${textOf(a)}"`)
+  const replayed = replayLog(server)
+  check('typing while disconnected is folded into one batch, and that batch is replayable',
+    queuedWhileDown === 0 && server.version === 1 && textOf(a).length === 2 && !replayed.startsWith('BROKEN')
+      && jsonOf(a) === replayed && !a.client.hasUnacked && a.stats.rebuilds === 0,
+    `server at v${server.version} for two edits, text "${textOf(a)}", log ${replayed}`)
 }
 
 const failed = results.filter((result) => !result.ok)
