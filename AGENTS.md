@@ -23,7 +23,7 @@ Backend (run from `backend/`):
 mvn spring-boot:run -Dspring-boot.run.profiles=dev   # http://localhost:8080, schema in collabdoc_dev
 mvn spring-boot:run                                  # default profile, schema in collabdoc
 mvn -o -DskipTests package
-mvn test                                             # 57 tests on in-memory H2, no MySQL needed
+mvn test                                             # 60 tests on in-memory H2, no MySQL needed
 ```
 
 `CollabInvariantTest` and `DocumentSequencerTest` encode *why* the design is correct: the sequence is unique
@@ -41,6 +41,15 @@ are baked into that URL: it reads a `JSON` column back **quoted** — so never a
 `command_params` string in a test, the MySQL shape (`JSON_TYPE = OBJECT`, parsed by the client) is what
 matters and is checked at the wire level — and it keeps `USER` as a reserved word, which `NON_KEYWORDS=USER`
 releases; without it the `user` table is never created and every test that touches an account fails on DDL.
+
+A test that sleeps a fixed window and then counts is a test that depends on which classes were loaded before
+it: `CollabFrameListenerTest`'s first version was green inside `mvn test` and red on
+`mvn -Dtest=CollabFrameListenerTest`, because the first attempt costs a few hundred cold milliseconds and only
+fits a 150 ms window once some earlier `@SpringBootTest` has warmed Spring Data Redis, Lettuce and Mockito.
+Wait on a predicate over the state under test (`await(() -> ..., "...")` there) rather than on elapsed time,
+and mutate the branch before believing a thread-safety test is green. A log appender a test attaches at class
+start can also be dropped under it — Boot re-initialises Logback around the context load, and the reset takes
+the appender with it, so `RedisBusModeTest` re-attaches on every poll.
 
 Frontend (run from `frontend/`):
 
@@ -198,7 +207,17 @@ never came up at all** — a node that booted a moment before its Redis, or rest
 simply gone. `CollabFrameListener` now owns the container and subscribes from a retrying virtual thread, so
 the node comes up degraded, says so, and catches up when Redis answers — and the log line is asserted, because
 "Unable to connect to Redis" means it got as far as the network while "Subscriber not created" would mean the
-hand-built container skipped `afterPropertiesSet()` and would fail forever with Redis perfectly healthy.
+hand-built container skipped `afterPropertiesSet()` and would fail forever with Redis perfectly healthy
+(that counterfactual is not a guess — deleting the call turns `theListenerBlamesTheConnectionRatherThanItsOwnSetup`
+red on exactly that text).
+Exactly **one** container may be adopted per lifecycle: a second subscribed container hands every frame to the
+local sockets twice, so the attempt thread keeps the one it built only by winning
+`container.compareAndSet(null, candidate)`, a superseded attempt releases its own instead of orphaning it, and
+a generation counter stops an interrupted thread from retrying behind the next `start()` (`stop()` interrupts
+rather than joins, because the wait between attempts can be the full retry cap). Of those three, the CAS and
+the release-after-adoption are **reasoned, not exercised** — reaching them needs an attempt that succeeds, i.e.
+a Redis — while the generation guard and the interrupt are both covered by `CollabFrameListenerTest`, each
+verified by mutation.
 
 The window before the first successful subscription is a real limit worth stating: the node publishes but
 receives nothing, so it is write-only, and the usual recovery does not cover it — a client attached to that node

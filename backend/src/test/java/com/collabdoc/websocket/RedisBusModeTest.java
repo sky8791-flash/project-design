@@ -2,7 +2,9 @@ package com.collabdoc.websocket;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
-import ch.qos.logback.core.read.ListAppender;
+import ch.qos.logback.core.AppenderBase;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -10,8 +12,10 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.TestPropertySource;
 
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -70,38 +74,83 @@ class RedisBusModeTest {
     }
 
     /**
-     * The failing subscription is the point of the whole degraded-start design, so its wording is asserted.
+     * The failing subscription is the point of the whole degraded-start design, so its wording is asserted:
+     * "Unable to connect to Redis" means the attempt reached the network, while "Subscriber not created" would
+     * mean the hand-built container skipped {@code afterPropertiesSet()} and would keep failing with Redis
+     * perfectly healthy. Checked by mutation — deleting that call turns this red on exactly that message, which
+     * is the only reason to trust the comment beside it.
      *
-     * <p>The container is built by hand rather than being a bean, which means nothing calls
-     * {@code afterPropertiesSet()} for us — skip it and every attempt fails with "Subscriber not created",
-     * with Redis healthy, forever and quietly. The message distinguishes the two failures. Waiting for a
-     * second one is the only way to see the retry loop at all, since no test has a Redis to succeed against.
-     * </p>
+     * <p>Only the first warning is waited for: the cadence doubles from five seconds, so a second one costs
+     * fifteen and proves nothing this test is about. {@code CollabFrameListenerTest} covers the loop, the stop
+     * and the superseded attempt at a millisecond cadence that can actually be asserted.</p>
      */
-    @Test
-    void theListenerRetriesAndBlamesTheConnectionNotItsOwnSetup() throws InterruptedException {
-        Logger log = (Logger) LoggerFactory.getLogger(RedisCollabBus.class);
-        ListAppender<ILoggingEvent> events = new ListAppender<>();
-        events.start();
-        log.addAppender(events);
-        try {
-            long deadline = System.currentTimeMillis() + 30_000;
-            while (System.currentTimeMillis() < deadline && attempts(events).size() < 2) {
-                Thread.sleep(200);
-            }
-            List<String> attempts = attempts(events);
-            assertThat(attempts).as("the retry loop ran more than once").hasSizeGreaterThanOrEqualTo(2);
-            assertThat(attempts.get(0)).contains("Unable to connect to Redis");
-            assertThat(attempts.get(0)).doesNotContain("Subscriber not created");
-        } finally {
-            log.detachAppender(events);
-        }
+    private static final Recorded LOG = new Recorded();
+
+    @BeforeAll
+    static void watchTheBusLogger() {
+        attach();
     }
 
-    private static List<String> attempts(ListAppender<ILoggingEvent> events) {
-        return events.list.stream()
-                .map(ILoggingEvent::getFormattedMessage)
-                .filter(message -> message.contains("could not subscribe"))
-                .toList();
+    @AfterAll
+    static void stopWatchingTheBusLogger() {
+        ((Logger) LoggerFactory.getLogger(RedisCollabBus.class)).detachAppender(LOG);
+    }
+
+    /**
+     * Attaches the recorder to the bus logger unless something already has it.
+     *
+     * <p>Called from the poll loop as well as from {@code @BeforeAll}, because Boot initialises Logback around
+     * the context load and that reset drops an appender attached before it. Attached once at class start, this
+     * recorded nothing on its own and everything on its own when the class ran first — the wording under test is
+     * still worth asserting, so the attachment has to survive rather than the assertion have to move.</p>
+     */
+    private static void attach() {
+        Logger logger = (Logger) LoggerFactory.getLogger(RedisCollabBus.class);
+        if (!LOG.isStarted()) LOG.start();
+        Iterator<ch.qos.logback.core.Appender<ILoggingEvent>> attached = logger.iteratorForAppenders();
+        while (attached.hasNext()) {
+            if (attached.next() == LOG) return;
+        }
+        logger.addAppender(LOG);
+    }
+
+    @Test
+    void theListenerBlamesTheConnectionRatherThanItsOwnSetup() throws InterruptedException {
+        List<String> attempts = List.of();
+        long deadline = System.currentTimeMillis() + 25_000;
+        while (System.currentTimeMillis() < deadline && attempts.isEmpty()) {
+            attach();
+            Thread.sleep(500);
+            attempts = LOG.matching("could not subscribe");
+        }
+        assertThat(attempts)
+                .as("the listener reported why it could not subscribe; the listener logged %s", LOG.tail(5))
+                .isNotEmpty();
+        assertThat(attempts.get(0)).contains("Unable to connect to Redis");
+        assertThat(attempts.get(0)).doesNotContain("Subscriber not created");
+    }
+
+    /**
+     * Logback's own {@code ListAppender} appends to a plain {@code ArrayList} without holding a lock, and this
+     * class listens for the lifetime of a context whose retry thread keeps writing while the test polls, so the
+     * recording list has to be thread-safe.
+     */
+    private static final class Recorded extends AppenderBase<ILoggingEvent> {
+
+        private final List<String> messages = new CopyOnWriteArrayList<>();
+
+        @Override
+        protected void append(ILoggingEvent event) {
+            messages.add(event.getFormattedMessage());
+        }
+
+        List<String> matching(String fragment) {
+            return messages.stream().filter(message -> message.contains(fragment)).toList();
+        }
+
+        /** What the listener did say, for a failure message that can be diagnosed without rerunning. */
+        List<String> tail(int count) {
+            return messages.subList(Math.max(0, messages.size() - count), messages.size());
+        }
     }
 }

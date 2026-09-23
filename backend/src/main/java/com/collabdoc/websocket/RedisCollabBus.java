@@ -27,6 +27,7 @@ import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Cross-process fan-out. Every node subscribes to one channel and delivers only to the sessions it holds,
@@ -344,29 +345,59 @@ class RedisCollabBus implements CollabBus {
      */
     static class CollabFrameListener implements SmartLifecycle {
 
-        private static final Duration RETRY_AFTER = Duration.ofSeconds(5);
+        private static final Duration FIRST_RETRY = Duration.ofSeconds(5);
         // Redis being down for an hour should not cost 720 warnings, so the gap widens until it is refused.
         private static final Duration RETRY_CAP = Duration.ofMinutes(1);
         private final RedisConnectionFactory factory;
         private final MessageListener listener;
+        private final Duration firstRetry;
+        private final Duration retryCap;
         private final AtomicBoolean running = new AtomicBoolean();
-        private volatile RedisMessageListenerContainer container;
+        private final AtomicReference<RedisMessageListenerContainer> container = new AtomicReference<>();
         private volatile Thread attempt;
-        private Duration delay = RETRY_AFTER;
+        // Bumped under the {@code running} CAS, so writes to it are ordered by that CAS's volatile semantics.
+        private volatile long generation;
 
         CollabFrameListener(RedisConnectionFactory factory, MessageListener listener) {
+            this(factory, listener, FIRST_RETRY, RETRY_CAP);
+        }
+
+        /** The retry cadence is open to a test: nothing should have to wait five seconds to assert on it. */
+        CollabFrameListener(RedisConnectionFactory factory, MessageListener listener,
+                            Duration firstRetry, Duration retryCap) {
             this.factory = factory;
             this.listener = listener;
+            this.firstRetry = firstRetry;
+            this.retryCap = retryCap;
         }
 
         @Override
         public void start() {
             if (!running.compareAndSet(false, true)) return;
-            attempt = Thread.ofVirtual().name("collab-listener-starter").start(this::startUntilReachable);
+            long generation = ++this.generation;
+            // The generation is in the thread name because two attempts of one lifecycle are otherwise
+            // indistinguishable in the log, and this class is exactly where that would hurt.
+            attempt = Thread.ofVirtual().name("collab-listener-attempt-", generation)
+                    .start(() -> startUntilReachable(generation));
         }
 
-        private void startUntilReachable() {
-            while (running.get()) {
+        /**
+         * Only the thread the latest {@link #start()} owns may keep trying or adopt a container.
+         *
+         * <p>{@code stop()} interrupts rather than joins — joining could block shutdown on a connect that
+         * ignores interrupts — so a superseded attempt can wake up to find {@code running} true again, set by a
+         * later {@code start()}. The generation is what separates that from a fresh lifecycle; without it the
+         * old thread keeps retrying beside its replacement, and since {@code running} says {@code true} every
+         * check it makes looks like a clean retry. It cannot subscribe twice (the CAS on {@code container}
+         * allows one), but it would win that slot against the live attempt and then hold it — see
+         * {@link #startUntilReachable}'s supersede checks, which are what make the losing path survivable.</p>
+         *
+         * <p>Lifecycle calls are assumed not to overlap: {@code start()} from a {@code stop()} that has not
+         * finished is not a case this handles.</p>
+         */
+        private void startUntilReachable(long generation) {
+            Duration delay = firstRetry;
+            while (running.get() && this.generation == generation) {
                 RedisMessageListenerContainer candidate = new RedisMessageListenerContainer();
                 candidate.setConnectionFactory(factory);
                 candidate.addMessageListener(listener, new ChannelTopic(CHANNEL));
@@ -375,40 +406,64 @@ class RedisCollabBus implements CollabBus {
                     // to register with, which fails every attempt forever rather than just this one.
                     candidate.afterPropertiesSet();
                     candidate.start();
-                    container = candidate;
-                    if (!running.get()) {
-                        // Stopped while this was in flight: {@code stop()} saw null, so this thread releases it.
-                        release();
+                    if (superseded(generation)) {
+                        destroy(candidate, "superseded before it could be adopted");
                         return;
                     }
-                    delay = RETRY_AFTER;
-                    log.info("Collab frame listener subscribed to {}", CHANNEL);
-                    return;
-                } catch (Exception e) {
-                    try {
-                        candidate.destroy();
-                    } catch (Exception cleanup) {
-                        // Nothing was acquired in the usual case; worth hearing when it was, which happens for
-                        // a failure after the connection had already been obtained.
-                        log.warn("Collab frame listener cleanup failed: {}", cleanup.getMessage());
+                    if (!container.compareAndSet(null, candidate)) {
+                        // Somebody else's container is in the slot. Giving up here is what would leave the node
+                        // subscribed by nobody, because the only other holder can be an attempt this one
+                        // supersedes — and it releases the slot a moment after. Ours must not be orphaned either.
+                        destroy(candidate, "superseded by the container already in the slot");
+                        log.warn("Collab frame listener found {} already held by another attempt; retrying in {}",
+                                CHANNEL, delay);
+                    } else if (superseded(generation)) {
+                        // Stopped after the adoption was won: that stop's {@code release()} may already have
+                        // looked and found the slot empty, so this thread is the one that lets it go — but only
+                        // while the slot still holds *this* container, or we would tear down a live subscription.
+                        if (container.compareAndSet(candidate, null)) {
+                            destroy(candidate, "released an adoption its stop never saw");
+                        }
+                        return;
+                    } else {
+                        log.info("Collab frame listener subscribed to {}", CHANNEL);
+                        return;
                     }
-                    log.warn("Collab frame listener could not subscribe; retrying in {}s: {}",
-                            delay.toSeconds(), e.getMessage());
-                    if (!waitBeforeRetry()) return;
+                } catch (Exception e) {
+                    destroy(candidate, "released after a failed attempt");
+                    // The throwable rather than the stack: at the capped cadence an outage would otherwise
+                    // cost a trace a minute, and {@code toString} carries the cause chain anyway.
+                    log.warn("Collab frame listener could not subscribe; retrying in {}: {}", delay, e.toString());
                 }
+                if (!waitBeforeRetry(delay)) return;
+                delay = delay.compareTo(retryCap) >= 0 ? retryCap : delay.multipliedBy(2);
             }
         }
 
+        /** @return whether this attempt has been replaced by a newer one, or stood down. */
+        private boolean superseded(long generation) {
+            return generation != this.generation || !running.get();
+        }
+
         /** @return false when the thread was told to stop while it waited. */
-        private boolean waitBeforeRetry() {
+        private boolean waitBeforeRetry(Duration delay) {
             try {
                 Thread.sleep(delay.toMillis());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return false;
             }
-            delay = delay.compareTo(RETRY_CAP) >= 0 ? RETRY_CAP : delay.multipliedBy(2);
             return true;
+        }
+
+        private void destroy(RedisMessageListenerContainer candidate, String whatHappened) {
+            try {
+                candidate.destroy();
+            } catch (Exception e) {
+                // Nothing was acquired in the usual case; worth hearing when it was, which happens for a
+                // failure after the connection had already been obtained.
+                log.warn("Collab frame listener could not be destroyed ({}): {}", whatHappened, e.toString());
+            }
         }
 
         @Override
@@ -420,18 +475,12 @@ class RedisCollabBus implements CollabBus {
         }
 
         /**
-         * Releases the subscribed container. {@code destroy} rather than {@code stop}, because the task executor
-         * the container built in {@code afterPropertiesSet} is only released by the former.
+         * {@code destroy} rather than {@code stop}: the task executor the container builds in
+         * {@code afterPropertiesSet} is only released by the former.
          */
         private void release() {
-            RedisMessageListenerContainer subscribed = container;
-            container = null;
-            if (subscribed == null) return;
-            try {
-                subscribed.destroy();
-            } catch (Exception e) {
-                log.warn("Releasing the collab frame listener failed: {}", e.getMessage());
-            }
+            RedisMessageListenerContainer subscribed = container.getAndSet(null);
+            if (subscribed != null) destroy(subscribed, "releasing");
         }
 
         @Override
