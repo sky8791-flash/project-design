@@ -144,6 +144,10 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     })
     for (const log of data) {
       if (log.version <= version) continue
+      // The endpoint returns everything after our version, which includes the frame that made us
+      // refetch. Applying it here and again in the caller inserts the same text twice, so stop at the
+      // version we were asked to catch up to.
+      if (log.version > throughVersion) break
       if (log.commandType !== 'STEPS') {
         // A whole-document replace happened above us: only a fresh checkpoint can rebuild from it.
         await bootstrapNow(await fetchState())

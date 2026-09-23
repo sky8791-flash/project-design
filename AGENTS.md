@@ -256,12 +256,16 @@ the socket handshake refuses a missing/garbage/disabled token. Add to it rather 
 
 Remaining known holes: no rate limiting or lockout on `/api/users/login`, and there is no CSRF concern
 only because the API is token-in-header and fully JSON — do not add cookie/session auth without revisiting
-that. One more, found by verification: **an operation the client cannot replay has no terminal recovery.**
-The server never interprets content, so it accepts any step batch; if one of them cannot be applied (a
-buggy or hostile client can write one), `otClient`'s "fall back to full resync" re-enters the same replay,
-logs the same error repeatedly and the tab stops syncing — including its own typing. Recorded with
-reproduction and three candidate policies in the plan doc; fix it in `catchUp`, not by making the server
-parse documents.
+that. **One open P0 defect**: an out-of-order pair of frames — the remote `STEPS` for a concurrent write
+arriving *before* our own `ACK` — wedges the tab. Reproduced in a real browser by holding the outbound
+`STEP_BATCH` (patch `WebSocket.prototype.send` in the page) while a second client commits: the local text
+disappears, the status line reads `Cannot read properties of undefined (reading 'resolve')`, thrown from
+`applySteps` via `view.dispatch`, and the local batch never lands. What is ruled out: it is not a
+hand-written step shape (the payload was copied from a genuine client batch), and it is not replaying our
+own row in `catchUp` (that double-application was fixed — `catchUp` now stops at `throughVersion` — and
+the crash survives). The remaining suspect is `integrate()`'s mapping when `outstanding` is dropped by a
+`REJECT` while a gap refetch has already advanced `version`. Start by reproducing it in Node against
+`@tiptap/pm` with the two captured payloads, not in the browser.
 
 ## REST surface
 
@@ -322,7 +326,9 @@ tabs as two different users (share it `READ_WRITE` first). Things worth watching
   (DevTools → the socket's Messages tab, filter on `STEPS`).
 - `USER_LEFT` arrives **with** `onlineCount` and the number goes down when a tab closes.
 - Typing in both tabs simultaneously: one batch is acked, the other receives `REJECT`, and both tabs
-  converge on the same text with no caret jumps.
+  converge on the same text with no caret jumps. **This one currently fails** — see the open P0 defect
+  above; do not mark a change to `otClient.js` verified until this passes with the frames delivered in
+  both orders.
 - `SELECT document_id, version, COUNT(*) FROM operation_log GROUP BY 1,2 HAVING COUNT(*) > 1` → empty,
   same for `document_snapshot`.
 - Restarting the backend keeps history (`GET /{id}/history`), and restoring a version makes `version`
