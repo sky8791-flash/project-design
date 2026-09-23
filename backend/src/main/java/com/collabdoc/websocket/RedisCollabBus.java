@@ -46,16 +46,20 @@ class RedisCollabBus implements CollabBus {
     private static final Duration NODE_TTL = Duration.ofSeconds(30);
     // Cannot occur in a session id or a document key, so it splits the two unambiguously.
     private static final char MEMBER_SEPARATOR = '\0';
+    // Bounds the retry work one tick spends, so a poison member cannot starve the ones queued behind it.
+    private static final int MAX_DRAIN_PER_TICK = 32;
+    private static final int MAX_PENDING_REMOVALS = 1_000;
 
     private final StringRedisTemplate redis;
     private final ObjectMapper objectMapper;
     private final LocalDelivery delivery;
     private final String nodeId = UUID.randomUUID().toString();
     /**
-     * Sessions whose removal Redis refused. A missed {@code HDEL} is not self-healing the way a missed
-     * {@code HSET} is — the heartbeat only ever adds, and pruning drops only fields of dead nodes, so a
-     * ghost member would keep this node's own live id and inflate {@code onlineCount} for every client on
-     * every document until the process restarted.
+     * Closed sessions whose removal the heartbeat still owes. A missed {@code HDEL} is not self-healing the
+     * way a missed {@code HSET} is — the sweep only ever adds, and pruning drops only fields of dead nodes,
+     * so a ghost member keeps this node's own live id and inflates {@code onlineCount} for every client on
+     * every document until the process restarts. Closing therefore records the intent first and lets the
+     * drain, which runs after the sweep, be the single authority.
      */
     private final Set<String> pendingRemovals = ConcurrentHashMap.newKeySet();
 
@@ -104,12 +108,21 @@ class RedisCollabBus implements CollabBus {
 
     @Override
     public void sessionLeft(String documentId, String sessionId) {
+        String member = documentId + MEMBER_SEPARATOR + sessionId;
+        // The intent is recorded even when the delete succeeds, and only the heartbeat's drain clears it.
+        // Otherwise a live tick that snapshotted this session before it closed would re-add the member
+        // afterwards, and a field owned by this node's still-live lease is never pruned by anyone.
+        pendingRemovals.add(member);
         try {
             redis.opsForHash().delete(DOC_SESSIONS + documentId, sessionId);
         } catch (Exception e) {
-            pendingRemovals.add(documentId + MEMBER_SEPARATOR + sessionId);
-            log.warn("Could not drop membership for session {} on doc {}: {}; retrying on the next tick",
-                    sessionId, documentId, e.getMessage());
+            if (pendingRemovals.size() > MAX_PENDING_REMOVALS) {
+                log.error("Deferring membership removals for {} sessions; Redis has been unreachable long "
+                        + "enough that presence cannot be trusted on this node", pendingRemovals.size());
+                return;
+            }
+            log.warn("Could not drop membership for session {} on doc {}; retrying on the next tick",
+                    sessionId, documentId);
         }
     }
 
@@ -163,43 +176,48 @@ class RedisCollabBus implements CollabBus {
     }
 
     /**
-     * Refreshes this node's lease and re-asserts its membership, then drains any removals Redis refused.
-     * The lease is refreshed *last* on purpose: if it were renewed before a sweep that then failed, peers
-     * would see this node alive while the documents after the failure had no members recorded at all, and
-     * their tabs would silently count zero here.
+     * Re-asserts this node's membership, drains the removals queued since the last tick, then renews the
+     * lease. Liveness is renewed **independently** of the sweep: gating it on "every document succeeded"
+     * would let one poisoned key cost the whole node its lease, and peers would then prune every document
+     * this node holds — an oscillating, silent presence loss.
      */
     @Scheduled(fixedRate = 10_000)
     void renewNodeLease() {
         Map<String, Map<String, String>> byDocument = new HashMap<>();
-        delivery.forEachLiveSession((documentId, sessionId) ->
-                byDocument.computeIfAbsent(documentId, k -> new HashMap<>()).put(sessionId, nodeId));
-        boolean swept = true;
+        try {
+            delivery.forEachLiveSession((documentId, sessionId) ->
+                    byDocument.computeIfAbsent(documentId, k -> new HashMap<>()).put(sessionId, nodeId));
+        } catch (RuntimeException e) {
+            log.warn("Could not snapshot local sessions for the membership tick: {}", e.getMessage());
+        }
         for (Map.Entry<String, Map<String, String>> entry : byDocument.entrySet()) {
             try {
                 redis.opsForHash().putAll(DOC_SESSIONS + entry.getKey(), entry.getValue());
             } catch (Exception e) {
                 // One document must not starve the ones after it in iteration order.
-                swept = false;
                 log.warn("Could not re-assert membership for doc {}: {}", entry.getKey(), e.getMessage());
             }
         }
+        int attempted = 0;
         for (String member : List.copyOf(pendingRemovals)) {
+            if (attempted++ >= MAX_DRAIN_PER_TICK) break;
             int split = member.indexOf(MEMBER_SEPARATOR);
+            if (split < 0) {
+                pendingRemovals.remove(member);
+                continue;
+            }
             try {
                 redis.opsForHash().delete(DOC_SESSIONS + member.substring(0, split),
                         member.substring(split + 1));
                 pendingRemovals.remove(member);
             } catch (Exception e) {
-                log.warn("Membership removal still failing for {}: {}", member, e.getMessage());
-                break;
+                log.warn("Membership removal still pending for {}: {}", member, e.getMessage());
             }
         }
-        if (swept) {
-            try {
-                redis.opsForValue().set(NODE + nodeId, "1", NODE_TTL);
-            } catch (Exception e) {
-                log.warn("Could not renew collab node lease: {}", e.getMessage());
-            }
+        try {
+            redis.opsForValue().set(NODE + nodeId, "1", NODE_TTL);
+        } catch (Exception e) {
+            log.warn("Could not renew collab node lease: {}", e.getMessage());
         }
     }
 

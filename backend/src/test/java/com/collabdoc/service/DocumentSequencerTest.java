@@ -1,5 +1,6 @@
 package com.collabdoc.service;
 
+import com.collabdoc.dto.OperationLogDTO;
 import com.collabdoc.entity.Document;
 import com.collabdoc.entity.OperationLog;
 import com.collabdoc.exception.ConflictException;
@@ -23,6 +24,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 /**
  * The sequencing contract the whole collaboration design rests on: concurrent writers either get a
@@ -133,11 +135,16 @@ class DocumentSequencerTest {
         assertThat(List.of(first, second, third)).containsExactly(1, 2, 3);
         assertThat(operationLogRepository.findByDocumentIdOrderByVersionAsc(docId))
             .extracting(OperationLog::getVersion).containsExactly(1, 2, 3);
-        // The history view resolves the author through the user row and folds the retained snapshots in as
-        // their own entries, so a fabricated owner id would read back as "未知用户" instead of this name.
+        // The history view resolves the author through the user row, so a fabricated owner id shows up as
+        // the "unknown user" fallback. Asserted on the replay rows only: the checkpoint row belongs to the
+        // system, and pinning its label would make this test about a display string.
         assertThat(documentService.getOperationHistory(docId))
-            .extracting(com.collabdoc.dto.OperationLogDTO::getUsername)
-            .containsExactly("系统检查点", ownerName, ownerName, ownerName);
+            .filteredOn(row -> "STEPS".equals(row.getCommandType()))
+            .extracting(OperationLogDTO::getUserId, OperationLogDTO::getUsername)
+            .containsExactly(tuple(ownerId, ownerName), tuple(ownerId, ownerName), tuple(ownerId, ownerName));
+        assertThat(documentService.getOperationHistory(docId))
+            .extracting(OperationLogDTO::getUsername)
+            .doesNotContain("未知用户");
     }
 
     @Test

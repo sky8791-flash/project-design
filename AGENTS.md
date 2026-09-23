@@ -134,8 +134,12 @@ map owns delivery — is what keeps multi-instance support from being a special 
   subscribes and delivers locally, and the publishing node takes the same path rather than shortcutting —
   one delivery path, so the origin-session exclusion lives in exactly one place. Membership is
   `collab:doc:{documentId}` → `{sessionId: nodeId}` plus a `collab:node:{nodeId}` lease that a 10s
-  `@Scheduled` heartbeat refreshes; that same tick **re-asserts this node's sessions**, which is what makes
-  a `onlineCount` reader's pruning of dead-node fields self-healing instead of permanently lossy.
+  `@Scheduled` heartbeat renews. The tick **adds** this node's live sessions, then **drains** a queue of
+  closings, then renews the lease — each step independently guarded. That order is load-bearing: closing
+  records the removal intent even when its `HDEL` succeeded, because a sweep that snapshotted the session
+  beforehand would otherwise re-add it, and a field owned by a live node is never pruned by anyone.
+  Renewing the lease last and unconditionally matters too — gating it on "every document succeeded" let one
+  poisoned key cost the node its lease and made peers prune every document it holds.
 
 `DocumentSubjectImpl` keeps one observer per document, attached when a session arrives and detached when the
 last one leaves. `notifyAllObservers` also publishes when this node holds **no** viewer: a rename or a
@@ -252,7 +256,12 @@ the socket handshake refuses a missing/garbage/disabled token. Add to it rather 
 
 Remaining known holes: no rate limiting or lockout on `/api/users/login`, and there is no CSRF concern
 only because the API is token-in-header and fully JSON — do not add cookie/session auth without revisiting
-that.
+that. One more, found by verification: **an operation the client cannot replay has no terminal recovery.**
+The server never interprets content, so it accepts any step batch; if one of them cannot be applied (a
+buggy or hostile client can write one), `otClient`'s "fall back to full resync" re-enters the same replay,
+logs the same error repeatedly and the tab stops syncing — including its own typing. Recorded with
+reproduction and three candidate policies in the plan doc; fix it in `catchUp`, not by making the server
+parse documents.
 
 ## REST surface
 
@@ -284,10 +293,13 @@ that.
   an exception to an HTTP status; the few remaining `try/catch` blocks only convert a malformed field into
   `IllegalArgumentException`. Do not re-scope the mapping per controller.
   Its catch-all `Exception` handler is why that class also maps Spring MVC's own signals
-  (`NoResourceFoundException`, `HttpRequestMethodNotSupportedException`, `HttpMessageNotReadableException`,
-  `MethodArgumentTypeMismatchException`) — without those, a mistyped id or an unknown path becomes a 500
-  instead of 400/404/405. `@ExceptionHandler` cannot list the `ErrorResponse` interface (not a `Throwable`),
-  so the concrete types are enumerated and the status is read per exception.
+  (`NoResourceFoundException`, `HttpRequestMethodNotSupportedException`, `HttpMessageNotReadableException`)
+  — without those, an unknown path or a wrong verb becomes a 500 instead of 404/405.
+  `MethodArgumentTypeMismatchException` is deliberately in the 400 clause above, not here.
+  `@ExceptionHandler` cannot list the `ErrorResponse` interface (not a `Throwable`), so the concrete types
+  are enumerated and the status is read per exception. `badRequest` takes `Throwable` because two of its
+  types are checked; narrowing it to `RuntimeException` still returns 400 but reverts the body to Boot's
+  shape, which is what `springOwnRoutingErrorsKeepTheirStatus…` fails on.
 - Services throw the exceptions above with human-readable messages.
 - Success/error strings are English on the backend, Chinese in the UI. Keep that split.
 - Constructor injection everywhere on the backend; no field `@Autowired`.

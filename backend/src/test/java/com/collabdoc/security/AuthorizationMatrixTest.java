@@ -127,11 +127,12 @@ class AuthorizationMatrixTest {
         mvc.perform(bearer(patch("/api/documents/1"), token)).andExpect(status().isMethodNotAllowed());
         mvc.perform(bearer(get("/api/documents/nope/nope/nope"), token)).andExpect(status().isNotFound());
         // The case that motivated the Throwable widening: MissingServletRequestParameterException is a
-        // checked exception, so a handler parametered on RuntimeException never ran for it and the body
-        // silently reverted to Boot's default error shape while the status still said 400.
+        // checked exception, so a handler parametered on RuntimeException never ran for it. The status was
+        // 400 either way and Boot's default body also has an "error" key, so only the *message* proves the
+        // advice answered: Boot would say "Bad Request", the advice says which parameter is missing.
         mvc.perform(bearer(get("/api/users/lookup"), token))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.error").exists());
+                .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("userCode")));
     }
 
     @Test

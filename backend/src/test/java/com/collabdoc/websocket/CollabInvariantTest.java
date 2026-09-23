@@ -146,17 +146,19 @@ class CollabInvariantTest {
 
     /**
      * The exclusion actually happens at the session map, not only in the observer: a registered session
-     * whose id equals {@code excludeSessionId} receives nothing, and a client whose socket throws
-     * mid-delivery does not propagate out of the fan-out.
+     * whose id equals {@code excludeSessionId} receives nothing, another session **of the same account**
+     * still does, and a client whose socket throws mid-delivery does not propagate out of the fan-out.
      */
     @Test
     void theSessionMapSkipsTheOriginAndSurvivesAFailingClient() throws Exception {
         WebSocketSessionManager sessions = new WebSocketSessionManager(new ObjectMapper());
         WebSocketSession origin = session("session-a");
+        WebSocketSession sameUserSecondTab = session("session-d");
         WebSocketSession broken = session("session-b");
         WebSocketSession healthy = session("session-c");
         org.mockito.Mockito.doThrow(new IOException("client went away")).when(broken).sendMessage(any());
         sessions.register("7", origin, 1L);
+        sessions.register("7", sameUserSecondTab, 1L);
         sessions.register("7", broken, 2L);
         sessions.register("7", healthy, 3L);
 
@@ -164,6 +166,7 @@ class CollabInvariantTest {
         assertThatCode(() -> sessions.deliverToDocument("7", frame, "session-a")).doesNotThrowAnyException();
 
         verify(origin, never()).sendMessage(any(TextMessage.class));
+        verify(sameUserSecondTab).sendMessage(any(TextMessage.class));
         verify(broken).sendMessage(any(TextMessage.class));
         verify(healthy).sendMessage(any(TextMessage.class));
     }
