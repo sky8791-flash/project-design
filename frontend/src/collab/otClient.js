@@ -4,19 +4,23 @@ import { Step, Mapping } from '@tiptap/pm/transform'
  * Client half of the collaboration protocol. The server only orders step batches, so every
  * convergence guarantee lives here.
  *
- * Ordering rules that are not optional:
- * - local steps join `pending` **synchronously** (ProseMirror has already applied them to the document);
- *   only the send is serialized onto the promise chain, otherwise steps typed during an awaited fetch
- *   would be invisible to `integrate()` and the incoming steps would land at the wrong offsets;
- * - at most one batch is outstanding, so acknowledgement bookkeeping stays trivial; later local steps
- *   fold into the unsent batch after mapping through its accumulated `Mapping`;
- * - incoming steps are mapped through our unacknowledged steps before being applied, and our steps are
- *   mapped through the incoming ones before being sent — both directions are required;
- * - frames are processed through one serialized chain because the server fans frames out after commit,
- *   so two writers' frames can arrive out of order; a version gap is closed by refetching
+ * The invariant most of this file exists to keep: every batch in `pending` carries `inDocument`, saying
+ * whether its steps are actually in this document right now. Incoming steps are mapped only over the ones
+ * that are, because those are the positions this document really has; the others — parked by a bootstrap, or
+ * typed while one awaited the network — are mapped *over* the incoming steps so they stay applicable, never
+ * the reverse way round.
+ *
+ * Other rules that are not optional:
+ * - local steps join `pending` **synchronously** (ProseMirror has already applied them); only the send is
+ *   serialized onto the promise chain, otherwise steps typed during an awaited fetch would be invisible to
+ *   `integrate()` and incoming steps would land at the wrong offsets;
+ * - at most one batch is outstanding, so acknowledgement bookkeeping stays trivial; later local steps fold
+ *   into the unsent batch after mapping through its accumulated `Mapping`;
+ * - frames are processed through one serialized chain because the server fans frames out after commit, so
+ *   two writers' frames can arrive out of order; a version gap is closed by refetching
  *   `GET /{id}/operations?after=`;
- * - a bootstrap replaces the document, so whatever we had applied but never saw committed has to be
- *   re-applied afterwards or the user loses the text typed while the socket was down.
+ * - a bootstrap replaces the document, so whatever we applied but cannot be shown to have committed has to
+ *   be re-applied afterwards or the user loses the text typed while the socket was down.
  */
 export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   let version = 0
@@ -24,7 +28,6 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   let pending = []
   let outstanding = null
   let checkpointDue = false
-  let sawOwnCommit = false
   let tail = Promise.resolve()
   let destroyed = false
 
@@ -52,11 +55,22 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     return tail
   }
 
-  const unackedSteps = () => pending.flatMap((batch) => batch.steps)
+  const unackedSteps = () =>
+    pending.filter((batch) => batch.inDocument).flatMap((batch) => batch.steps)
 
-  const mapThrough = (steps, maps) =>
-    steps.map((step) => maps.reduce((current, map) => (current ? current.map(map) : null), step))
-      .filter(Boolean)
+  /**
+   * A step that maps to nothing had its target removed by an unacknowledged delete, so no part of its effect
+   * survives: dropping it is right on both sides of the mapping. `what` only labels the log line — a run of
+   * these is what a real divergence looks like from inside this client, and refusing to apply the incoming
+   * steps instead would trade one lost range for a tab that never catches up again.
+   */
+  const mapWith = (steps, mapping, what) => {
+    const mapped = steps.map((step) => step.map(mapping)).filter(Boolean)
+    if (what && mapped.length !== steps.length) {
+      console.warn(`collab: ${steps.length - mapped.length} ${what} step(s) were deleted out from under us`)
+    }
+    return mapped
+  }
 
   const stepsFrom = (raw) => {
     const schema = editor.state.schema
@@ -76,16 +90,16 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   }
 
   /**
-   * Interleaves one incoming batch with the steps that are applied locally but not yet acknowledged:
-   * the incoming steps are mapped through ours so they land in this document, and ours are mapped
-   * through theirs so they stay sendable against the server's order.
+   * Interleaves one incoming batch with our unacknowledged steps: theirs mapped over what is in this
+   * document so it lands here, ours mapped over theirs so they stay sendable against the server's order.
    */
   const integrate = (incomingSteps) => {
-    const incomingMaps = incomingSteps.map((step) => step.getMap())
-    const applicable = mapThrough(incomingSteps, unackedSteps().map((step) => step.getMap()))
+    const applicable = mapWith(incomingSteps,
+      new Mapping(unackedSteps().map((step) => step.getMap())), 'incoming')
 
+    const overTheirs = new Mapping(incomingSteps.map((step) => step.getMap()))
     pending.forEach((batch) => {
-      batch.steps = mapThrough(batch.steps, incomingMaps)
+      batch.steps = mapWith(batch.steps, overTheirs)
     })
     pending = pending.filter((batch) => batch.steps.length)
     if (outstanding && !outstanding.steps.length) outstanding = null
@@ -107,7 +121,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
 
   const flush = () => {
     if (outstanding || !ws.isConnected()) return
-    const next = pending.find((batch) => !batch.sent)
+    const next = pending.find((batch) => !batch.sent && batch.inDocument)
     if (next) {
       // Everything earlier is acknowledged, so the server's current version is this batch's base.
       next.base = version
@@ -120,11 +134,11 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     if (!steps.length) return
 
     const last = pending[pending.length - 1]
-    if (last && !last.sent && last.base === version) {
+    if (last && !last.sent && last.inDocument && last.base === version) {
       const mapping = new Mapping(last.steps.map((step) => step.getMap()))
       last.steps = last.steps.concat(steps.map((step) => step.map(mapping)).filter(Boolean))
     } else {
-      pending.push({ base: version, steps: [...steps], sent: false })
+      pending.push({ base: version, steps: [...steps], sent: false, inDocument: true })
     }
     enqueue(async () => flush())
   }
@@ -135,11 +149,28 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   }
 
   /**
+   * Proves that one specific batch reached the log, and only from the version that proves it.
+   *
+   * The server refuses any batch whose base is not the current version and commits the accepted one at
+   * exactly `base + 1`, so a row, frame or acknowledgement carrying that version is the proof. A flag for
+   * "we saw some row of ours" cannot stand in for it: a replay spans everything above the checkpoint, which
+   * is up to `CHECKPOINT_EVERY` versions of older work, and dropping or reviving on that evidence loses or
+   * duplicates the batch the user is waiting on.
+   */
+  const acknowledge = (committedVersion) => {
+    const batch = pending.find((candidate) => candidate.sent && candidate.base + 1 === committedVersion)
+    if (!batch) return
+    batch.committed = true
+    pending = pending.filter((candidate) => candidate !== batch)
+    if (outstanding === batch) outstanding = null
+  }
+
+  /**
    * Applies the log rows above `version`.
    *
    * `replayOwn` distinguishes the callers: after a bootstrap the document only holds content up to the
    * checkpoint, so rows we authored must be replayed too; mid-session our own rows are already in the
-   * document, and replaying them would duplicate text.
+   * document, and replaying them would duplicate text. Either way the row proves that batch committed.
    */
   const catchUp = async (throughVersion, { replayOwn = false } = {}) => {
     const { data } = await api.get(`/api/documents/${documentId}/operations`, {
@@ -158,12 +189,8 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
       }
       const params = JSON.parse(log.commandParams)
       if (params.clientId === clientId) {
-        sawOwnCommit = true
-        if (!replayOwn) {
-          dropAcknowledgedOutstanding()
-        } else {
-          applySteps(stepsFrom(params.steps || []))
-        }
+        acknowledge(log.version)
+        if (replayOwn) applySteps(stepsFrom(params.steps || []))
       } else {
         applySteps(integrate(stepsFrom(params.steps || [])))
       }
@@ -173,25 +200,24 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
     if (version < throughVersion) throw new Error(`operations log stopped at ${version}`)
   }
 
-  const dropAcknowledgedOutstanding = () => {
-    if (!outstanding) return
-    pending = pending.filter((batch) => batch !== outstanding)
-    outstanding = null
-  }
-
   const handleSteps = (frame) =>
     enqueue(async () => {
       const seq = frame.version
       if (seq <= version) return
       if (seq > version + 1) await catchUp(seq - 1)
+      // Closing that gap can rebuild the whole document (a nested bootstrap adopts the newest version), in
+      // which case this frame's own steps are already applied.
+      if (seq <= version) return
 
       if (frame.clientId === clientId) {
-        sawOwnCommit = true
-        dropAcknowledgedOutstanding()
+        acknowledge(seq)
       } else {
         applySteps(integrate(stepsFrom(frame.steps || [])))
       }
-      version = seq
+      // Never lower it: a bootstrap nested inside that catchUp may already have adopted a newer version
+      // than the frame we are finishing, and downgrading would make the next replay re-apply rows that are
+      // already in the document.
+      version = Math.max(version, seq)
 
       emit('version', version)
       flush()
@@ -202,7 +228,7 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
       if (frame.clientId !== clientId) return
       // The batch may already have been dropped (all its steps deleted by a concurrent edit), but its
       // version still has to be adopted or every later batch would be rejected against a stale base.
-      dropAcknowledgedOutstanding()
+      acknowledge(frame.version)
       version = Math.max(version, frame.version)
       emit('version', version)
       if (frame.checkpointRequested) checkpointDue = true
@@ -216,6 +242,9 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   const handleReject = (frame) =>
     enqueue(async () => {
       if (frame.clientId !== clientId || !outstanding) return
+      // The version a rejection carries is the server's current one, so anything at or below this batch's
+      // base is answering an older batch — reverting the current one would have it sent twice.
+      if (frame.version <= outstanding.base) return
       const rejected = outstanding
       rejected.sent = false
       outstanding = null
@@ -257,29 +286,39 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   }
 
   const bootstrapNow = async (state) => {
-    const carried = pending.filter((batch) => !batch.sent)
-    const unacked = outstanding
-    pending = carried
-    outstanding = null
+    // The document is about to be replaced, so none of our batches are in it any more — but they stay in
+    // `pending`, because `integrate()` still has to re-map their steps over everything the replay applies.
+    // Anything typed during this function is the exception: ProseMirror applies it to the new document
+    // straight away, so it keeps `inDocument` and must not be applied twice by the loop below.
+    pending.forEach((batch) => { batch.inDocument = false })
     checkpointDue = false
-    sawOwnCommit = false
 
     setContent(state.content, state.contentFormat ?? 'html', state.checkpointVersion ?? state.version)
     emit('presence', state.onlineCount)
     if (state.version > version) await catchUp(state.version, { replayOwn: true })
 
-    // `carried` steps were mapped by integrate() while catching up; the unacknowledged batch is only
-    // re-applied when the log proves the server never committed it.
-    if (unacked && !sawOwnCommit) {
-      unacked.sent = false
-      carried.push(unacked)
-    }
-    const revived = carried.filter((batch) => batch.steps.length)
-    revived.forEach((batch) => {
+    // A sent batch whose version the *checkpoint* has passed cannot be recovered from the log any more: rows
+    // at or below it were folded and deleted when that checkpoint was recorded, and folding only ever
+    // happens to rows that were committed — so its content is already in the document we just loaded, and
+    // reviving it would duplicate text that the next upload then burns into everyone's history. Above the
+    // checkpoint the replay answers the question instead: our own row proves it by identity in
+    // `acknowledge`, and the absence of any row at that version means a peer won the race, so the batch is
+    // still ours to resend.
+    const rebuiltFrom = state.checkpointVersion ?? state.version
+    const folded = (batch) => batch.sent && batch.base + 1 <= rebuiltFrom
+    const waiting = pending.filter((batch) =>
+      !batch.inDocument && !batch.committed && !folded(batch) && batch.steps.length)
+    // Keep whatever became `inDocument` while the replay was in flight — the user went on typing — and drop
+    // everything else from the list before re-adding the revived batches on top.
+    pending = pending.filter((batch) => batch.inDocument)
+    outstanding = null
+    waiting.forEach((batch) => {
       applySteps(batch.steps)
+      batch.inDocument = true
+      batch.sent = false
       batch.base = version
+      pending.push(batch)
     })
-    pending = revived
 
     emit('version', version)
     flush()

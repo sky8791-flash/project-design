@@ -110,10 +110,17 @@ command object had nothing to act on. Do not reintroduce them; the reasoning is 
 ### Client side (`frontend/src/collab/otClient.js`)
 
 Convergence lives here. At most one batch is outstanding; later local steps fold into the unsent
-batch through a `Mapping`. `integrate()` maps incoming steps through the local steps that are applied
-but unacknowledged (so they land in this document) and maps the pending batches through the incoming
-steps (so they remain sendable against the server's order) — both directions are required, and
-skipping the first is the classic lost-update/`TransformError` bug. Frames are handled through one
+batch through a `Mapping`. Each batch carries `inDocument`: incoming steps are mapped only over batches
+whose steps really are in this document, while *all* pending batches (including the ones parked for a
+replay) are mapped over the incoming ones so they stay sendable — mapping incoming steps over parked ones
+would push them past text that is not there yet, and that asymmetry is the point of `bootstrapNow`'s
+park/revive step. Commit bookkeeping is per batch, never per client: the server commits an accepted batch at
+exactly `base + 1`, so `acknowledge(version)` releases only the batch carrying that version — a "we saw one
+of our own rows" flag spans everything above the checkpoint (up to `CHECKPOINT_EVERY` versions of older
+work) and loses or duplicates the batch the user is waiting on. A step that maps to nothing is dropped on
+both sides of the mapping — that is the correct OT answer when an unacknowledged delete took its target — and
+only logged, because refusing to apply incoming steps instead would trade one lost range for a tab that never
+catches up. Frames are handled through one
 serialized promise chain because the server fans frames out after commit, so two writers' frames can
 arrive out of order; a version gap is closed by refetching `GET /api/documents/{id}/operations?after=`.
 Any error in that chain falls back to `resync()`.
@@ -365,12 +372,12 @@ tabs as two different users (share it `READ_WRITE` first). Things worth watching
   (DevTools → the socket's Messages tab, filter on `STEPS`).
 - `USER_LEFT` arrives **with** `onlineCount` and the number goes down when a tab closes.
 - Typing in both tabs simultaneously: one batch is acked, the other receives `REJECT`, and both tabs
-  converge on the same text with no caret jumps. Partly verified 2026-09-23, after the `addStep` fix: with
-  one browser tab plus one scripted `STEP_BATCH` writer, the tab applied the remote frame live and its text
-  equalled the text a reload rebuilt from `operation_log` at the same version. **The `REJECT` leg on the
-  browser side is still unverified** — that needs two writers racing the same base, which the scripted
-  writer has not been made to do yet. Do not mark a change to `otClient.js` verified until it passes with
-  the frames delivered in both orders.
+  converge on the same text with no caret jumps. **Verified 2026-09-23** on the recipe above: a tab held its
+  own `STEP_BATCH`, a scripted writer committed `REMOTE` at the same base, the tab applied that frame live
+  (`LOCALREMOTE`), the held batch was then delivered and came back `REJECT`ed, `catchUp` + rebase resent it,
+  and the server ended on `v2` with one row each — then a reload rebuilt the identical text, and fresh
+  typing still worked (`v3`). What has *not* been tested is that second browser tab as a peer: the scripted
+  writer has no editor, so nothing asserts that two ProseMirror views converge on the same positions.
 - `SELECT document_id, version, COUNT(*) FROM operation_log GROUP BY 1,2 HAVING COUNT(*) > 1` → empty,
   same for `document_snapshot`.
 - Restarting the backend keeps history (`GET /{id}/history`), and restoring a version makes `version`
