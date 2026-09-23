@@ -275,6 +275,17 @@ apply to this document". The lead to chase is therefore which step `integrate()`
 twice) for a document that no longer has those offsets, not the selection code. Reproduce in the browser
 (the simplified Node harness with a minimal schema is not trustworthy: it throws on a plain local apply).
 
+Ruled out since, by reading rather than by test: incoming steps mapped through a batch the server had
+*already committed*. `sendBatch` fixes such a batch's version at `base + 1`, because the row-locked CAS only
+accepts `baseVersion == current`, so a remote frame can only reach `integrate()` with it still in `pending`
+at `version + 1` — which means it branched from the same base and the mapping is required; anything above
+that trips the gap check first, and `catchUp` walks our own log row and calls `dropAcknowledgedOutstanding()`
+before the frame is applied. That also reframes the repro: patching `WebSocket.prototype.send` leaves
+`outstanding` pointing at a batch the server never saw (`sent` only means "handed to the transport"), so no
+`REJECT` will ever arrive to rebase it. Remaining suspects are what `mapThrough` *silently drops* (a step
+whose `map()` returns null disappears from `pending`) and whether the held batch's steps are being applied a
+second time by the local undo history rather than by the protocol.
+
 ## REST surface
 
 - `/api/users` — `POST /register`, `POST /login` (both return a token), `GET /lookup?userCode=`
