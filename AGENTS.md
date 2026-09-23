@@ -23,7 +23,7 @@ Backend (run from `backend/`):
 mvn spring-boot:run -Dspring-boot.run.profiles=dev   # http://localhost:8080, schema in collabdoc_dev
 mvn spring-boot:run                                  # default profile, schema in collabdoc
 mvn -o -DskipTests package
-mvn test                                             # 43 tests on in-memory H2, no MySQL needed
+mvn test                                             # 44 tests on in-memory H2, no MySQL needed
 ```
 
 `CollabInvariantTest` and `DocumentSequencerTest` encode *why* the design is correct: the sequence is unique
@@ -142,9 +142,9 @@ map owns delivery — is what keeps multi-instance support from being a special 
   is never pruned by anyone. And the pass shares a 5s wall-clock budget — which is why renewal comes first:
   a stalled Redis costs a read timeout per call, and a node holding ~150 documents would otherwise spend
   longer between renewals than the 30s lease lasts, watching peers prune members of a live node. Because the
-  budget can cut the pass short, the next tick **starts where this one stopped**; iteration order is stable
-  while the document set holds, so a fixed order would starve the same tail forever, and after a lapsed lease
-  only this sweep can restore this node's own members.
+  budget (or its cap of 8 failing documents) can cut the pass short, the next tick **starts where this one
+  stopped**; the visit order is rebuilt identically every tick, so a fixed start would starve the same tail
+  forever, and after a lapsed lease only this sweep can restore this node's own members.
 
 `DocumentSubjectImpl` keeps one observer per document, attached when a session arrives and detached when the
 last one leaves. `notifyAllObservers` also publishes when this node holds **no** viewer: a rename or a

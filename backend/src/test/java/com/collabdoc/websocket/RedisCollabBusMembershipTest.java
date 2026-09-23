@@ -142,6 +142,35 @@ class RedisCollabBusMembershipTest {
         assertThat(reasserted().get("collab:doc:8").keySet()).containsExactly("s2");
     }
 
+    @Test
+    void aTickStopsAtTheFailureCapAndTheNextOneResumesPastIt() {
+        for (int i = 0; i < 10; i++) {
+            live.put("doc" + i, new ArrayList<>(List.of("s")));
+        }
+        doAnswer(call -> {
+            throw new RuntimeException("Connection refused");
+        }).when(hashOps).putAll(any(), any());
+
+        bus.membershipHeartbeat();
+        // Failures, not attempts, are budgeted: with a cap that counted attempts the first 8 would be the
+        // only documents ever visited while they kept failing.
+        assertThat(visitedKeys()).hasSize(8);
+
+        clearInvocations(hashOps);
+        bus.membershipHeartbeat();
+        assertThat(visitedKeys()).startsWith("collab:doc:doc8").hasSize(8);
+    }
+
+    /** The documents one tick visited, in call order. */
+    private List<String> visitedKeys() {
+        List<String> keys = new ArrayList<>();
+        for (Invocation call : mockingDetails(hashOps).getInvocations()) {
+            if (!"putAll".equals(call.getMethod().getName())) continue;
+            keys.add((String) flatten(call.getArguments()).get(0));
+        }
+        return keys;
+    }
+
     /** Fields the bus tried to {@code HDEL} from one document's key. */
     private Set<String> deletedFields(String key) {
         Set<String> fields = new TreeSet<>();

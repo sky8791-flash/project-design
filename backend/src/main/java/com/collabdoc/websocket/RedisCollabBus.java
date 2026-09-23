@@ -45,11 +45,9 @@ class RedisCollabBus implements CollabBus {
     private static final String DOC_SESSIONS = "collab:doc:";
     private static final String NODE = "collab:node:";
     private static final Duration NODE_TTL = Duration.ofSeconds(30);
-    // Cannot occur in a session id or a document key, so it splits the two unambiguously.
-    private static final char MEMBER_SEPARATOR = '\0';
-    // Caps how many documents whose Redis call failed one tick may touch. Counts failures, not attempts, so
-    // a poison key (a wrong-type value at collab:doc:X) cannot push the healthy documents behind it out of
-    // the tick — and {@link #rotation} keeps "behind it" from meaning "forever".
+    // How many documents one tick may visit once their Redis calls start failing. Counts *failed* documents,
+    // not attempts, so a poison key (a wrong-type value at collab:doc:X) cannot push the healthy documents
+    // behind it out of the tick — and rotation keeps "behind it" from meaning "forever".
     private static final int MAX_FAILED_DOCUMENTS_PER_TICK = 8;
     // An alarm, not a bound: only the failing branch reads the size, so it fires once Redis has been
     // unreachable long enough for the owed-removal queue to grow, which is exactly when presence stops being
@@ -66,12 +64,13 @@ class RedisCollabBus implements CollabBus {
     private final String nodeId = UUID.randomUUID().toString();
     /**
      * Closed sessions whose removal the heartbeat still owes. A missed {@code HDEL} is not self-healing the
-     * way a missed {@code HSET} is — the sweep only ever adds, and pruning drops only fields of dead nodes,
-     * so a ghost member keeps this node's own live id and inflates {@code onlineCount} on that document until
-     * the process restarts. Closing therefore records the intent first and lets the drain be the authority
-     * that clears it, because a tick that snapshotted the session before it closed would otherwise re-add it.
+     * way a missed {@code HSET} is — the sweep only ever adds, and pruning drops only fields of nodes whose
+     * lease lapsed — so a ghost member carries this node's own live id and inflates {@code onlineCount} on
+     * that document until this node's lease lapses or it restarts under a new id. Closing therefore records
+     * the intent first and lets the heartbeat clear it only once the delete lands, because a tick that
+     * snapshotted the session before it closed would otherwise re-add it.
      */
-    private final Set<String> pendingRemovals = ConcurrentHashMap.newKeySet();
+    private final Set<OwedRemoval> pendingRemovals = ConcurrentHashMap.newKeySet();
     /**
      * Where in the document list the last tick stopped working, so the next one starts there. Touched only by
      * the single scheduler thread that runs {@link #membershipHeartbeat()}.
@@ -123,11 +122,9 @@ class RedisCollabBus implements CollabBus {
 
     @Override
     public void sessionLeft(String documentId, String sessionId) {
-        String member = documentId + MEMBER_SEPARATOR + sessionId;
-        // The intent is recorded even when the delete succeeds, and only the heartbeat's drain clears it.
-        // Otherwise a live tick that snapshotted this session before it closed would re-add the member
-        // afterwards, and a field owned by this node's still-live lease is never pruned by anyone.
-        pendingRemovals.add(member);
+        // Recorded even when the delete below succeeds, and cleared only by a delete that landed: a tick that
+        // snapshotted this session before it closed would otherwise re-add it.
+        pendingRemovals.add(new OwedRemoval(documentId, sessionId));
         try {
             redis.opsForHash().delete(DOC_SESSIONS + documentId, sessionId);
         } catch (Exception e) {
@@ -191,17 +188,19 @@ class RedisCollabBus implements CollabBus {
     }
 
     /**
-     * Renews the node lease, then gives every document that needs one exactly one {@code HSETALL} and one
-     * {@code HDEL}.
+     * Renews the node lease, then visits every document that needs it with at most one {@code HSETALL} and one
+     * {@code HDEL} each.
      *
      * <p>The lease is renewed <em>first</em> and unconditionally: gating it on "every document succeeded"
      * would let one poisoned key cost the whole node its lease and have peers prune every document this node
      * holds, and renewing it last would let the round trips below push the next renewal past
-     * {@link #NODE_TTL}. {@link #TICK_BUDGET} caps the rest so a stalled Redis cannot do that either — and
-     * since the budget can cut the list short, {@link #rotation} starts the next tick where this one stopped.
-     * That is not cosmetic: {@code HashMap} iteration order is stable while the key set holds, so a fixed
-     * order would starve the same tail every tick, and after a lapsed lease only this sweep can put this
-     * node's own members back.</p>
+     * {@link #NODE_TTL}. {@link #TICK_BUDGET} caps the rest so a stalled Redis cannot do that either.</p>
+     *
+     * <p>Because the budget and {@link #MAX_FAILED_DOCUMENTS_PER_TICK} can cut the visit short, the next tick
+     * resumes at {@link #rotation} rather than at the head of the list — the list is rebuilt the same way every
+     * tick, so resuming at 0 would starve the same tail indefinitely, and after a lapsed lease only this sweep
+     * can put this node's own members back. Resuming is not exact: when documents leave the list the cursor can
+     * pass over a slot, which costs one tick, not a permanent stall.</p>
      */
     @Scheduled(fixedRate = 10_000)
     void membershipHeartbeat() {
@@ -224,10 +223,8 @@ class RedisCollabBus implements CollabBus {
         // same pass clears the intent, and only on success, because a field naming a live node is pruned by
         // nobody else.
         Map<String, Set<String>> owed = new HashMap<>();
-        for (String member : List.copyOf(pendingRemovals)) {
-            int split = member.indexOf(MEMBER_SEPARATOR);
-            owed.computeIfAbsent(member.substring(0, split), k -> new HashSet<>())
-                    .add(member.substring(split + 1));
+        for (OwedRemoval removal : Set.copyOf(pendingRemovals)) {
+            owed.computeIfAbsent(removal.documentId(), k -> new HashSet<>()).add(removal.sessionId());
         }
 
         Set<String> documents = new TreeSet<>(byDocument.keySet());
@@ -242,9 +239,9 @@ class RedisCollabBus implements CollabBus {
             visited++;
             boolean broken = false;
 
+            Set<String> ghosts = owed.get(documentId);
             Map<String, String> members = byDocument.get(documentId);
             if (members != null) {
-                Set<String> ghosts = owed.get(documentId);
                 if (ghosts != null) members.keySet().removeAll(ghosts);
                 if (!members.isEmpty()) {
                     try {
@@ -255,13 +252,12 @@ class RedisCollabBus implements CollabBus {
                     }
                 }
             }
-            Set<String> ghosts = owed.get(documentId);
             // One varargs call for the whole document: an outage that closed sessions across 50 documents
             // costs 50 round trips, not one per closed session.
             if (ghosts != null) {
                 try {
                     redis.opsForHash().delete(DOC_SESSIONS + documentId, ghosts.toArray());
-                    ghosts.forEach(field -> pendingRemovals.remove(documentId + MEMBER_SEPARATOR + field));
+                    ghosts.forEach(field -> pendingRemovals.remove(new OwedRemoval(documentId, field)));
                 } catch (Exception e) {
                     broken = true;
                     log.warn("Could not drop {} membership field(s) on doc {}, retrying on the next tick: {}",
@@ -314,6 +310,9 @@ class RedisCollabBus implements CollabBus {
             return null;
         }
     }
+
+    /** A session this node still owes a membership removal for. */
+    private record OwedRemoval(String documentId, String sessionId) {}
 
     record FrameEnvelope(Long userId, String documentId, String excludeSessionId, Map<String, Object> frame) {}
 }
