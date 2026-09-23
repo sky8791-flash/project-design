@@ -4,10 +4,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.data.redis.connection.Message;
+import org.springframework.data.redis.connection.MessageListener;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.listener.ChannelTopic;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.context.annotation.Bean;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -23,6 +26,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Cross-process fan-out. Every node subscribes to one channel and delivers only to the sessions it holds,
@@ -296,21 +300,21 @@ class RedisCollabBus implements CollabBus {
     }
 
     @Bean
-    RedisMessageListenerContainer collabFrameListenerContainer(RedisConnectionFactory factory) {
-        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
-        container.setConnectionFactory(factory);
-        container.addMessageListener((message, pattern) -> {
-            FrameEnvelope envelope = read(new String(message.getBody(), StandardCharsets.UTF_8));
-            if (envelope == null) return;
-            // The document id decides which kind of frame this is. A frame carrying neither is dropped
-            // rather than handed to a map lookup keyed on null.
-            if (envelope.documentId() != null) {
-                delivery.deliverToDocument(envelope.documentId(), envelope.frame(), envelope.excludeSessionId());
-            } else if (envelope.userId() != null) {
-                delivery.deliverToUser(envelope.userId(), envelope.frame());
-            }
-        }, new ChannelTopic(CHANNEL));
-        return container;
+    CollabFrameListener collabFrameListener(RedisConnectionFactory factory) {
+        return new CollabFrameListener(factory, this::onFrame);
+    }
+
+    /** The receive half of the bus: one envelope in, delivered to whichever sessions this node holds. */
+    void onFrame(Message message, byte[] pattern) {
+        FrameEnvelope envelope = read(new String(message.getBody(), StandardCharsets.UTF_8));
+        if (envelope == null) return;
+        // The document id decides which kind of frame this is. A frame carrying neither is dropped
+        // rather than handed to a map lookup keyed on null.
+        if (envelope.documentId() != null) {
+            delivery.deliverToDocument(envelope.documentId(), envelope.frame(), envelope.excludeSessionId());
+        } else if (envelope.userId() != null) {
+            delivery.deliverToUser(envelope.userId(), envelope.frame());
+        }
     }
 
     private FrameEnvelope read(String json) {
@@ -326,4 +330,113 @@ class RedisCollabBus implements CollabBus {
     private record OwedRemoval(String documentId, String sessionId) {}
 
     record FrameEnvelope(Long userId, String documentId, String excludeSessionId, Map<String, Object> frame) {}
+
+    /**
+     * Owns the subscriber and starts it off the context's critical path, retrying until Redis answers.
+     *
+     * <p>Spring Data's {@code RedisMessageListenerContainer} implements {@code SmartLifecycle} and has no
+     * auto-startup switch, so exposing it as a bean means an unreachable Redis fails {@code start()} during
+     * context refresh and the application comes up as a failure: a node that boots a moment before its Redis,
+     * or restarts while Redis is down, never joins the cluster at all. That contradicts what this bus
+     * promises everywhere else — frames are recoverable, every one carries a version and a client that sees a
+     * gap refetches it — so the coherent behaviour is to start degraded, say so loudly, and subscribe as soon
+     * as the server responds. Once subscribed, the container's own recovery handles later drops.</p>
+     */
+    static class CollabFrameListener implements SmartLifecycle {
+
+        private static final Duration RETRY_AFTER = Duration.ofSeconds(5);
+        // Redis being down for an hour should not cost 720 warnings, so the gap widens until it is refused.
+        private static final Duration RETRY_CAP = Duration.ofMinutes(1);
+        private final RedisConnectionFactory factory;
+        private final MessageListener listener;
+        private final AtomicBoolean running = new AtomicBoolean();
+        private volatile RedisMessageListenerContainer container;
+        private volatile Thread attempt;
+        private Duration delay = RETRY_AFTER;
+
+        CollabFrameListener(RedisConnectionFactory factory, MessageListener listener) {
+            this.factory = factory;
+            this.listener = listener;
+        }
+
+        @Override
+        public void start() {
+            if (!running.compareAndSet(false, true)) return;
+            attempt = Thread.ofVirtual().name("collab-listener-starter").start(this::startUntilReachable);
+        }
+
+        private void startUntilReachable() {
+            while (running.get()) {
+                RedisMessageListenerContainer candidate = new RedisMessageListenerContainer();
+                candidate.setConnectionFactory(factory);
+                candidate.addMessageListener(listener, new ChannelTopic(CHANNEL));
+                try {
+                    // Not a bean, so nobody calls this for us — and without it the container has no subscriber
+                    // to register with, which fails every attempt forever rather than just this one.
+                    candidate.afterPropertiesSet();
+                    candidate.start();
+                    container = candidate;
+                    if (!running.get()) {
+                        // Stopped while this was in flight: {@code stop()} saw null, so this thread releases it.
+                        release();
+                        return;
+                    }
+                    delay = RETRY_AFTER;
+                    log.info("Collab frame listener subscribed to {}", CHANNEL);
+                    return;
+                } catch (Exception e) {
+                    try {
+                        candidate.destroy();
+                    } catch (Exception cleanup) {
+                        // Nothing was acquired in the usual case; worth hearing when it was, which happens for
+                        // a failure after the connection had already been obtained.
+                        log.warn("Collab frame listener cleanup failed: {}", cleanup.getMessage());
+                    }
+                    log.warn("Collab frame listener could not subscribe; retrying in {}s: {}",
+                            delay.toSeconds(), e.getMessage());
+                    if (!waitBeforeRetry()) return;
+                }
+            }
+        }
+
+        /** @return false when the thread was told to stop while it waited. */
+        private boolean waitBeforeRetry() {
+            try {
+                Thread.sleep(delay.toMillis());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            delay = delay.compareTo(RETRY_CAP) >= 0 ? RETRY_CAP : delay.multipliedBy(2);
+            return true;
+        }
+
+        @Override
+        public void stop() {
+            running.set(false);
+            Thread thread = attempt;
+            if (thread != null) thread.interrupt();
+            release();
+        }
+
+        /**
+         * Releases the subscribed container. {@code destroy} rather than {@code stop}, because the task executor
+         * the container built in {@code afterPropertiesSet} is only released by the former.
+         */
+        private void release() {
+            RedisMessageListenerContainer subscribed = container;
+            container = null;
+            if (subscribed == null) return;
+            try {
+                subscribed.destroy();
+            } catch (Exception e) {
+                log.warn("Releasing the collab frame listener failed: {}", e.getMessage());
+            }
+        }
+
+        @Override
+        public boolean isRunning() {
+            return running.get();
+        }
+    }
 }

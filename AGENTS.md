@@ -23,7 +23,7 @@ Backend (run from `backend/`):
 mvn spring-boot:run -Dspring-boot.run.profiles=dev   # http://localhost:8080, schema in collabdoc_dev
 mvn spring-boot:run                                  # default profile, schema in collabdoc
 mvn -o -DskipTests package
-mvn test                                             # 47 tests on in-memory H2, no MySQL needed
+mvn test                                             # 57 tests on in-memory H2, no MySQL needed
 ```
 
 `CollabInvariantTest` and `DocumentSequencerTest` encode *why* the design is correct: the sequence is unique
@@ -187,10 +187,25 @@ registered/decorated session, never the raw one, or concurrent broadcasts interl
 crosses the send time or buffer limit and an escaping exception would skip every remaining session in the
 loop.
 
-Multi-instance status: **code complete, not runtime-verified.** Two nodes behind a broker were never
-exercised, because starting Docker Desktop on this machine makes the campus network refuse authentication
-(it detects the `vEthernet (WSL)` adapter). Everything above is verified only as far as the `memory` bus
-and unit tests go.
+Multi-instance status: **code complete, not runtime-verified — but the mode now at least boots.** Two nodes
+behind a broker were never exercised because starting Docker Desktop on this machine makes the campus network
+refuse authentication (it detects the `vEthernet (WSL)` adapter). `RedisBusModeTest` covers what needs no
+server: it starts the whole application context with `app.collab.bus=redis` pointed at a port nothing
+listens on, asserts the redis bus is the one wired, and asserts every call degrades instead of throwing.
+That test found a real deployment bug: `RedisMessageListenerContainer` is a `SmartLifecycle` bean with no
+auto-startup switch, so an unreachable Redis failed `start()` during context refresh and **the application
+never came up at all** — a node that booted a moment before its Redis, or restarted while Redis was down, was
+simply gone. `CollabFrameListener` now owns the container and subscribes from a retrying virtual thread, so
+the node comes up degraded, says so, and catches up when Redis answers — and the log line is asserted, because
+"Unable to connect to Redis" means it got as far as the network while "Subscriber not created" would mean the
+hand-built container skipped `afterPropertiesSet()` and would fail forever with Redis perfectly healthy.
+
+The window before the first successful subscription is a real limit worth stating: the node publishes but
+receives nothing, so it is write-only, and the usual recovery does not cover it — a client attached to that node
+never sees a gap to refetch if no frame arrives at all, and an idle reader can sit on stale content with a
+plausible `onlineCount` badge until the subscription lands. Presence is unaffected, since the heartbeat uses the
+command connection rather than the subscriber. That is why the retry is loud and unbounded rather than a
+give-up-after-N.
 
 ### WebSocket frames
 
