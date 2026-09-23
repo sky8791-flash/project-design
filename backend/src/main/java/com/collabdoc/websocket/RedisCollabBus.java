@@ -51,7 +51,7 @@ class RedisCollabBus implements CollabBus {
     private static final int MAX_FAILED_DOCUMENTS_PER_TICK = 8;
     // An alarm, not a bound: only the failing branch reads the size, so it fires once Redis has been
     // unreachable long enough for the owed-removal queue to grow, which is exactly when presence stops being
-    // trustworthy. The queue itself cannot be capped — dropping an owed removal recreates the ghost.
+    // trustworthy. The queue is not capped: an intent dropped here is a member nobody else can ever prune.
     private static final int PENDING_REMOVALS_LOG_THRESHOLD = 1_000;
     // Keeps one tick well inside {@link #NODE_TTL}. Each call to a stalled Redis costs the full read timeout,
     // so without a budget a node holding ~150 documents would spend longer between lease renewals than the
@@ -63,12 +63,13 @@ class RedisCollabBus implements CollabBus {
     private final LocalDelivery delivery;
     private final String nodeId = UUID.randomUUID().toString();
     /**
-     * Closed sessions whose removal the heartbeat still owes. A missed {@code HDEL} is not self-healing the
-     * way a missed {@code HSET} is — the sweep only ever adds, and pruning drops only fields of nodes whose
-     * lease lapsed — so a ghost member carries this node's own live id and inflates {@code onlineCount} on
-     * that document until this node's lease lapses or it restarts under a new id. Closing therefore records
-     * the intent first and lets the heartbeat clear it only once the delete lands, because a tick that
-     * snapshotted the session before it closed would otherwise re-add it.
+     * Removals the heartbeat still owes: a session whose close was announced here, or one it found registered
+     * but no longer open. A missed {@code HDEL} is not self-healing the way a missed {@code HSET} is — the
+     * sweep only ever adds, and pruning drops only fields of nodes whose lease lapsed — so a ghost member
+     * carries this node's own live id and inflates {@code onlineCount} on that document until this node's
+     * lease lapses or it restarts under a new id. {@code sessionLeft} records the intent even when its own
+     * delete lands, because a tick that snapshotted the session before it closed would otherwise re-add it,
+     * and an intent is cleared only once the delete lands.
      */
     private final Set<OwedRemoval> pendingRemovals = ConcurrentHashMap.newKeySet();
     /**
@@ -211,20 +212,29 @@ class RedisCollabBus implements CollabBus {
         }
 
         Map<String, Map<String, String>> byDocument = new HashMap<>();
+        Set<OwedRemoval> lingering = new HashSet<>();
         try {
-            delivery.forEachLiveSession((documentId, sessionId) ->
-                    byDocument.computeIfAbsent(documentId, k -> new HashMap<>()).put(sessionId, nodeId));
+            delivery.forEachLiveSession((documentId, sessionId, open) -> {
+                if (open) {
+                    byDocument.computeIfAbsent(documentId, k -> new HashMap<>()).put(sessionId, nodeId);
+                } else {
+                    lingering.add(new OwedRemoval(documentId, sessionId));
+                }
+            });
         } catch (RuntimeException e) {
             log.warn("Could not snapshot local sessions for the membership tick: {}", e.getMessage());
         }
+        // A session that went non-open without afterConnectionClosed running is never reported to sessionLeft,
+        // so the comparison above is the only way this node learns its member is a ghost — and a field naming
+        // a live node is pruned by nobody.
+        pendingRemovals.addAll(lingering);
 
-        // Fields this node still owes a removal for. The HSETALL must not re-assert them, which is what stops a
+        // Sessions this node owes a removal for. The HSETALL must not re-assert them, which is what stops a
         // tick that snapshotted a session moments before it closed from putting a ghost back; the HDEL in the
-        // same pass clears the intent, and only on success, because a field naming a live node is pruned by
-        // nobody else.
-        Map<String, Set<String>> owed = new HashMap<>();
+        // same pass clears the intent, and only on success.
+        Map<String, Set<OwedRemoval>> owed = new HashMap<>();
         for (OwedRemoval removal : Set.copyOf(pendingRemovals)) {
-            owed.computeIfAbsent(removal.documentId(), k -> new HashSet<>()).add(removal.sessionId());
+            owed.computeIfAbsent(removal.documentId(), k -> new HashSet<>()).add(removal);
         }
 
         Set<String> documents = new TreeSet<>(byDocument.keySet());
@@ -239,10 +249,10 @@ class RedisCollabBus implements CollabBus {
             visited++;
             boolean broken = false;
 
-            Set<String> ghosts = owed.get(documentId);
+            Set<OwedRemoval> ghosts = owed.get(documentId);
             Map<String, String> members = byDocument.get(documentId);
             if (members != null) {
-                if (ghosts != null) members.keySet().removeAll(ghosts);
+                if (ghosts != null) ghosts.forEach(removal -> members.remove(removal.sessionId()));
                 if (!members.isEmpty()) {
                     try {
                         redis.opsForHash().putAll(DOC_SESSIONS + documentId, members);
@@ -255,9 +265,10 @@ class RedisCollabBus implements CollabBus {
             // One varargs call for the whole document: an outage that closed sessions across 50 documents
             // costs 50 round trips, not one per closed session.
             if (ghosts != null) {
+                Object[] fields = ghosts.stream().map(OwedRemoval::sessionId).toArray();
                 try {
-                    redis.opsForHash().delete(DOC_SESSIONS + documentId, ghosts.toArray());
-                    ghosts.forEach(field -> pendingRemovals.remove(new OwedRemoval(documentId, field)));
+                    redis.opsForHash().delete(DOC_SESSIONS + documentId, fields);
+                    pendingRemovals.removeAll(ghosts);
                 } catch (Exception e) {
                     broken = true;
                     log.warn("Could not drop {} membership field(s) on doc {}, retrying on the next tick: {}",

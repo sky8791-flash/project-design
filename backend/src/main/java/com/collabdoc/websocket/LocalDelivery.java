@@ -1,7 +1,6 @@
 package com.collabdoc.websocket;
 
 import java.util.Map;
-import java.util.function.BiConsumer;
 
 /**
  * Delivery into the sockets this process owns. Implemented by {@link WebSocketSessionManager} and called
@@ -18,8 +17,14 @@ public interface LocalDelivery {
     int localOnlineCount(String documentId);
 
     /**
-     * Visits every session this process still holds, so a bus that tracks membership remotely can
-     * re-assert it instead of relying on the connect moment alone.
+     * Visits every session still registered with this process, reporting whether each one is open, so a bus
+     * that tracks membership remotely can re-assert the live ones and discover the ones no close callback
+     * ever reached. Skipping a non-open session would hide exactly the member that needs dropping.
      */
-    void forEachLiveSession(BiConsumer<String, String> visitor);
+    void forEachLiveSession(SessionVisitor visitor);
+
+    interface SessionVisitor {
+
+        void visit(String documentId, String sessionId, boolean open);
+    }
 }

@@ -49,6 +49,8 @@ class RedisCollabBusMembershipTest {
 
     /** Sessions this node holds, keyed by document. */
     private final Map<String, List<String>> live = new TreeMap<>();
+    /** Sessions still in the registry whose socket closed without {@code afterConnectionClosed} running. */
+    private final Map<String, List<String>> lingering = new TreeMap<>();
     private final HashOperations<String, Object, Object> hashOps = mock(HashOperations.class);
     private final ValueOperations<String, String> valueOps = mock(ValueOperations.class);
     private final StringRedisTemplate redis = mock(StringRedisTemplate.class);
@@ -59,8 +61,9 @@ class RedisCollabBusMembershipTest {
         doReturn(valueOps).when(redis).opsForValue();
         LocalDelivery delivery = mock(LocalDelivery.class);
         doAnswer(call -> {
-            BiConsumer<String, String> visitor = call.getArgument(0);
-            live.forEach((documentId, sessions) -> sessions.forEach(s -> visitor.accept(documentId, s)));
+            LocalDelivery.SessionVisitor visitor = call.getArgument(0);
+            live.forEach((documentId, sessions) -> sessions.forEach(s -> visitor.visit(documentId, s, true)));
+            lingering.forEach((documentId, sessions) -> sessions.forEach(s -> visitor.visit(documentId, s, false)));
             return null;
         }).when(delivery).forEachLiveSession(any());
         bus = new RedisCollabBus(redis, new ObjectMapper(), delivery);
@@ -140,6 +143,24 @@ class RedisCollabBusMembershipTest {
         order.verify(hashOps).putAll(eq("collab:doc:7"), any());
         // The loop continued past the failure: one bad key must not cost this node presence everywhere else.
         assertThat(reasserted().get("collab:doc:8").keySet()).containsExactly("s2");
+    }
+
+    @Test
+    void aSessionReportedAsNotOpenIsDroppedEvenThoughNothingAnnouncedItsClose() {
+        // No sessionLeft ever ran for it. If the bus only trusted announced closes, this member would keep
+        // naming a live node forever and the count on that document would stay wrong.
+        live.put("7", new ArrayList<>(List.of("s1")));
+        lingering.put("7", new ArrayList<>(List.of("ghost")));
+        bus.membershipHeartbeat();
+
+        assertThat(reasserted().get("collab:doc:7").keySet()).containsExactly("s1");
+        assertThat(deletedFields("collab:doc:7")).containsExactly("ghost");
+
+        // This stub registry never prunes the way WebSocketSessionManager does, so a ghost that is still
+        // reported stays owed — the delete repeating until it lands is the behaviour, not a leak.
+        clearInvocations(hashOps);
+        bus.membershipHeartbeat();
+        assertThat(deleteCalls("collab:doc:7")).isEqualTo(1);
     }
 
     @Test

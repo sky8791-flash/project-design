@@ -11,7 +11,6 @@ import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorato
 import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.BiConsumer;
 
 /**
  * Holds the sockets this process owns and writes to them; it is the {@link LocalDelivery} that whichever
@@ -109,12 +108,19 @@ public class WebSocketSessionManager implements LocalDelivery {
     }
 
     @Override
-    public void forEachLiveSession(BiConsumer<String, String> visitor) {
+    public void forEachLiveSession(LocalDelivery.SessionVisitor visitor) {
         documentSessions.forEach((documentId, sessions) ->
                 sessions.forEach((sessionId, session) -> {
-                    // Filter on isOpen: a session whose afterConnectionClosed never ran lingers in the map,
-                    // and re-asserting it would make it immortal in the shared membership hash.
-                    if (session.isOpen()) visitor.accept(documentId, sessionId);
+                    // Report a non-open session rather than skipping it: the membership bus can only drop a
+                    // field it is told about, and for these nothing ever tells it — afterConnectionClosed is
+                    // the only other remover and it never runs for this state.
+                    visitor.visit(documentId, sessionId, session.isOpen());
+                    if (!session.isOpen()) {
+                        sessions.remove(sessionId);
+                        sessionOwners.remove(sessionId);
+                        // Two-arg remove: a session registered for the same document in the meantime wins.
+                        if (sessions.isEmpty()) documentSessions.remove(documentId, sessions);
+                    }
                 }));
     }
 

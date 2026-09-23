@@ -23,7 +23,7 @@ Backend (run from `backend/`):
 mvn spring-boot:run -Dspring-boot.run.profiles=dev   # http://localhost:8080, schema in collabdoc_dev
 mvn spring-boot:run                                  # default profile, schema in collabdoc
 mvn -o -DskipTests package
-mvn test                                             # 44 tests on in-memory H2, no MySQL needed
+mvn test                                             # 47 tests on in-memory H2, no MySQL needed
 ```
 
 `CollabInvariantTest` and `DocumentSequencerTest` encode *why* the design is correct: the sequence is unique
@@ -145,6 +145,11 @@ map owns delivery — is what keeps multi-instance support from being a special 
   budget (or its cap of 8 failing documents) can cut the pass short, the next tick **starts where this one
   stopped**; the visit order is rebuilt identically every tick, so a fixed start would starve the same tail
   forever, and after a lapsed lease only this sweep can restore this node's own members.
+  `LocalDelivery.forEachLiveSession` reports **every** registered session with an `open` flag instead of
+  filtering closed ones out, precisely because a socket whose `afterConnectionClosed` never ran is never
+  announced to `sessionLeft`: registered-minus-open is the only signal that can discover such a ghost, and the
+  registry drops the entry as it reports it so the next tick does not re-drop it. Scope note: this covers a
+  close the container noticed; a half-open socket still reports `isOpen()` true and is re-asserted forever.
 
 `DocumentSubjectImpl` keeps one observer per document, attached when a session arrives and detached when the
 last one leaves. `notifyAllObservers` also publishes when this node holds **no** viewer: a rename or a
