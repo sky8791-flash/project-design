@@ -1,4 +1,37 @@
-import { Step, Mapping } from '@tiptap/pm/transform'
+import { ReplaceStep, Step, Mapping } from '@tiptap/pm/transform'
+
+/**
+ * `Mapping` with the boundary tie resolved the other way round, for one case only: an incoming *insertion*
+ * colliding with our unacknowledged work at the same position.
+ *
+ * `ReplaceStep.map` asks for `assoc = 1` at its own start, so mapping an insert across another insert at the
+ * same position puts it after the one already there. For an incoming step that is the wrong answer: our
+ * unacknowledged work has no sequence number yet, so the incoming step is always the earlier of the two and has
+ * to land first. Mapping both directions with the default tie-break is what let two clients typing at the same
+ * spot reach the same version with different text — "abXY" on one, "abYX" on the other, with the log saying
+ * "abXY".
+ */
+class TheirsFirst extends Mapping {
+  mapResult(pos) {
+    return super.mapResult(pos, -1)
+  }
+}
+
+/**
+ * Which mapping one incoming step should travel through. An incoming *insertion* — a zero-width range with
+ * content to put in it — takes the reversed tie-break; everything else keeps the default, because on a step
+ * that spans a range the two ends are asked for different associations deliberately (`from` with `1`, `to` with
+ * `-1`), and forcing both to `-1` widens the incoming range across our own unacknowledged text: a peer deleting
+ * one character next to our pending insert then deletes the inserted character too, on this client only, and
+ * the next checkpoint this tab uploads folds that loss into everybody's history. Upstream made the same
+ * distinction when it added `ReplaceStep.MAP_BIAS`, which applies only when `from == to`; the global flag
+ * cannot be used here anyway, because it would flip the ours-over-theirs direction too, and ours has to stay
+ * "after".
+ */
+const incomingMapping = (step, unackedMaps) =>
+  step instanceof ReplaceStep && step.from === step.to && step.slice.size > 0
+    ? new TheirsFirst(unackedMaps)
+    : new Mapping(unackedMaps)
 
 /**
  * Client half of the collaboration protocol. The server only orders step batches, so every
@@ -93,10 +126,12 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   /**
    * Interleaves one incoming batch with our unacknowledged steps: theirs mapped over what is in this
    * document so it lands here, ours mapped over theirs so they stay sendable against the server's order.
+   * Both directions are required; what decides convergence is the *tie-break* — see `TheirsFirst`.
    */
   const integrate = (incomingSteps) => {
-    const applicable = mapWith(incomingSteps,
-      new Mapping(unackedSteps().map((step) => step.getMap())), 'incoming')
+    const unackedMaps = unackedSteps().map((step) => step.getMap())
+    const applicable = incomingSteps.flatMap(
+      (step) => mapWith([step], incomingMapping(step, unackedMaps), 'incoming'))
 
     const overTheirs = new Mapping(incomingSteps.map((step) => step.getMap()))
     pending.forEach((batch) => {

@@ -57,10 +57,17 @@ Frontend (run from `frontend/`):
 npm install
 npm run dev          # http://localhost:5173, proxies /api and /ws to :8080
 npm run build && npm run preview
+npm run check:collab # convergence harness over the real otClient.js — plain Node, no server, ~3s
 ```
 
-There is no lint, formatter or test-runner script configured. `npm run build` is the only automated
-check that covers the frontend, so run it after any edit.
+There is no lint or formatter, and no general test runner: `npm run build` is the only automated check over the
+whole frontend and must be run after any edit. `scripts/collab-convergence.mjs` is the exception — it imports
+`src/collab/otClient.js` directly, drives it against an in-process sequencer that implements the documented
+server contract, and asserts convergence over ~310 rounds / ~790 local edits in six random configurations plus
+the orderings that used to be bugs. Its oracle is not "the tabs agree with each other" but "each tab equals an
+independent replay of the operation log", and a run only counts as converged when it needed **no**
+whole-document refetch — otherwise the recovery path passed and the protocol did not. Nothing runs it
+automatically. Exit 0 means 13 checks green; it also prints two KNOWN defects that are recorded, not fixed.
 
 Prerequisite: MySQL on `localhost:3306` with `root` and no password. `application.yml` targets
 database `collabdoc`; `application-dev.yml` overrides only the JDBC URL to `collabdoc_dev` with
@@ -134,6 +141,28 @@ serialized promise chain because the server fans frames out after commit, so two
 arrive out of order; a version gap is closed by refetching `GET /api/documents/{id}/operations?after=`.
 Any error in that chain rebuilds the whole client state from the server — except a history row that cannot
 be applied, which halts instead (see the next paragraph).
+
+**Mapping in both directions is not enough by itself: the tie has to break the same way on both sides.**
+`ReplaceStep.map` asks for `assoc = 1` at its own start, so an incoming insert landing at the position where a
+local unacknowledged insert already sits goes *after* it — and the same pair viewed from the other client also
+maps to "after", so the two documents end up with the two characters swapped. `incomingMapping` therefore sends
+an incoming **insertion** through `TheirsFirst`, a `Mapping` that forces `assoc = -1`, and everything else
+through a plain `Mapping`. The gate is load-bearing, not tidiness: an earlier unqualified version of this rule
+flipped the association of a range's `from` as well, which widens an incoming delete or mark across the
+character the local user has typed but not yet had committed. Reproduced before the fix: log `X@3` then `Y@4`,
+the server and one tab showing `abXY`, the other tab `abYX`, both at v4 with a drained queue and no halt — the
+version agreed and the content did not. Upstream added `ReplaceStep.MAP_BIAS` for the same tie and gates it on
+`from == to`; that flag cannot be used here because it is process-global and would flip the ours-over-theirs
+direction too, which must stay "after".
+
+Two KNOWN defects, both reproduced by `npm run check:collab` and neither explained: a peer's delete, and a
+peer's mark, landing at the position of our unacknowledged insert makes this tab lose that character and fall
+back to a whole-document refetch (the tab ends up matching the log, but the log never contained the user's
+text). Separately, a review reported that `integrate()` maps every step of a multi-step incoming batch through
+one static `Mapping` instead of successively, which yields stale offsets inside a batch — that one is
+**not** reproduced here, because the harness has no multi-step incoming batch: at most one batch is
+outstanding, so a peer's steps arrive in one frame and are applied as a unit. Treat it as the next thing to
+check if a real two-tab run ever disagrees.
 
 Whole-document state is only ever replaced on `INIT`, `RESET`, and the rebuild that any other error triggers, and always with
 `setContent(content, { emitUpdate: false })` — a plain `setContent` would echo the whole document back
