@@ -67,7 +67,7 @@ server contract, and asserts convergence over eight random configurations (405 r
 the scripted orderings that used to be bugs. Its oracle is not "the tabs agree with each other" but "each tab
 equals an independent replay of the operation log", and a run only counts as converged when it needed **no**
 whole-document refetch — otherwise the recovery path passed and the protocol did not. Nothing runs it
-automatically. Exit 0 means all 21 checks are green; the file also carries a known-defect mechanism — a
+automatically. Exit 0 means all 23 checks are green; the file also carries a known-defect mechanism — a
 scenario flagged `expectedToFail` fails the build if it ever passes, so a marker cannot outlive its fix.
 
 Prerequisite: MySQL on `localhost:3306` with `root` and no password. `application.yml` targets
@@ -179,13 +179,14 @@ arrive out of order; a version gap is closed by refetching `GET /api/documents/{
 Any error in that chain rebuilds the whole client state from the server — except a history row that cannot
 be applied, which halts instead (see the next paragraph).
 
-`npm run check:collab` is what these choices are tested against: 21 scenarios, all green. The eight random
+`npm run check:collab` is what these choices are tested against: 23 scenarios, all green. The eight random
 configurations additionally fail the run if any client needed a whole-document refetch, so their convergence is
 the protocol's and not the recovery path's; most scripted blocks assert the log replay and the drained queue
-but not the refetch count, and one (the unappliable row) rebuilds on purpose before it halts. What stays open is
-the coverage itself: the schema is hand-built
-(`doc/paragraph/text` + `bold/italic`), so `ReplaceAroundStep` — which every real list, blockquote or code block
-produces — never passes through `rebaseOver`, and nothing here exercises the real HTTP or WebSocket layer.
+but not the refetch count, and two rebuild on purpose before they halt (the unappliable row, and a
+whole-document write discovered through a version gap). What stays open is the coverage itself: the schema is
+hand-built (`doc/paragraph/text` + `bold/italic`), so `ReplaceAroundStep` — which every real list, blockquote or
+code block produces — never passes through `rebaseOver`, and nothing here exercises the real HTTP or WebSocket
+layer.
 
 Whole-document state is only ever replaced on `INIT`, `RESET`, and the rebuild that any other error triggers, and always with
 `setContent(content, { emitUpdate: false })` — a plain `setContent` would echo the whole document back

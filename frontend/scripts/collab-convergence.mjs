@@ -24,6 +24,7 @@ import { AddMarkStep, ReplaceStep, Step } from '@tiptap/pm/transform'
 import { createCollabClient } from '../src/collab/otClient.js'
 
 const CHARS = 'abcdefghijklmnop'
+const CHECKPOINTS_EVERY = 200
 
 const schema = new Schema({
   nodes: {
@@ -137,7 +138,13 @@ class Sequencer {
     return [
       // The unicast really goes out first: it is the sender's permission to release its next batch and it
       // cannot fail over the network, so it must never sit behind a broadcast that can.
-      { to: clientId, kind: 'unicast', frame: { type: 'ACK', clientId, version: this.version } },
+      {
+        to: clientId,
+        kind: 'unicast',
+        // `DocumentService` asks for a checkpoint on every `CHECKPOINT_EVERY`th committed version; the client
+        // then defers until its queue is drained, which is the only moment its document matches that version. That deferral is not covered here: neutralising the guard leaves every check green.
+        frame: { type: 'ACK', clientId, version: this.version, checkpointRequested: this.version % CHECKPOINTS_EVERY === 0 }
+      },
       { to: null, kind: 'broadcast', frame: { type: 'STEPS', clientId, version: this.version, steps } }
     ]
   }
@@ -153,11 +160,42 @@ class Sequencer {
     return this.version
   }
 
-  replace(content, clientId = 'restorer') {
+  replace(content, fromVersion, clientId = 'restorer') {
     this.version += 1
+    // A restore is a whole-document write forward under a new version: it records a `RESTORE` row and folds
+    // everything below it, which is what `DocumentService.restoreVersion` does
+    // (`deleteByDocumentIdUpToVersion(documentId, seq - 1)`). Without the fold the row that halted some client
+    // would still sit above the restored version and halt it again on the next gap.
+    this.log.push({
+      version: this.version,
+      commandType: 'RESTORE',
+      commandParams: JSON.stringify({ clientId, fromVersion })
+    })
+    this.log = this.log.filter((row) => row.version >= this.version)
     this.checkpoint = content
     this.checkpointVersion = this.version
     return { type: 'RESET', version: this.version, content: JSON.stringify(content), contentFormat: 'doc-json' }
+  }
+
+  /**
+   * A whole-document `PUT`, the other thing that puts a non-`STEPS` row in the log. Like a restore it becomes
+   * the checkpoint at its own version, so a client that reaches it through a version gap rebuilds once and
+   * then stops -- `catchUp`'s bootstrap branch is otherwise dead code in every run here.
+   *
+   * Deliberately does not broadcast the `RESET` the real `putContent` publishes: this models the client that
+   * only learns about the write through the gap, which is the branch under test.
+   */
+  saveWholeDoc(clientId, content) {
+    this.version += 1
+    this.log.push({
+      version: this.version,
+      commandType: 'SAVE',
+      commandParams: JSON.stringify({ action: 'replace', contentLength: JSON.stringify(content).length })
+    })
+    this.log = this.log.filter((row) => row.version >= this.version)
+    this.checkpoint = content
+    this.checkpointVersion = this.version
+    return this.version
   }
 
   operationsAfter(version) {
@@ -180,21 +218,6 @@ class Sequencer {
       version: this.version,
       checkpointVersion: this.checkpointVersion
     }
-  }
-}
-
-/**
- * A reset is supposed to be the only way out of a halt, and `handleReset` does not know the log — it clears
- * the halt, adopts the version it is given and trusts the content. So a restore has to fold the history it
- * replaced, the way recording a checkpoint does, or the row that halted the tab is still above the reader's
- * version and the next gap replay halts it again. Whether the real service does that is not something this
- * file can answer, so it states the requirement and checks the client against it.
- */
-class FoldingSequencer extends Sequencer {
-  replace(content, clientId = 'restorer') {
-    const frame = super.replace(content, clientId)
-    this.log = this.log.filter((row) => row.version > this.version)
-    return frame
   }
 }
 
@@ -565,7 +588,8 @@ await assertConverged('random: two writers, five edits per round, frames reverse
  * reconnect replay after the frame arrives (`RangeError: Position 8 out of range`), which drops the pending
  * insert instead of restoring it. Recorded rather than explained; see `knownDefects` and AGENTS.md.
  */
-const boundaryCase = async (name, foreign, expected) => {  const server = new Sequencer()
+const boundaryCase = async (name, foreign, expected) => {
+  const server = new Sequencer()
   const hub = new Hub(server)
   const a = clientScript(hub, server, 'a')
   hub.join('a', a.client)
@@ -766,7 +790,7 @@ await boundaryCase('our pending insert survives a peer mark at its position',
 
 {
   // The documented way out of a halt is a whole-document reset: restoring an older version.
-  const server = new FoldingSequencer()
+  const server = new Sequencer()
   const hub = new Hub(server)
   const a = clientScript(hub, server, 'a')
   hub.join('a', a.client)
@@ -777,7 +801,7 @@ await boundaryCase('our pending insert survives a peer mark at its position',
   hub.deliverTo('a', { type: 'STEPS', clientId: 'poison', version: server.commitUnappliable(poison), steps: poison })
   await settle()
   const haltedBefore = a.client.halted
-  hub.deliverTo('a', server.replace(a.editor.getJSON()))
+  hub.deliverTo('a', server.replace(a.editor.getJSON(), 1))
   await settle()
   await editThenDeliver(a, random, hub, { deletes: false })
   check('a reset clears the halt and makes the tab writable again',
@@ -882,6 +906,72 @@ await boundaryCase('our pending insert survives a peer mark at its position',
     queuedWhileDown === 0 && server.version === 1 && textOf(a).length === 2 && !replayed.startsWith('BROKEN')
       && jsonOf(a) === replayed && !a.client.hasUnacked && a.stats.rebuilds === 0,
     `server at v${server.version} for two edits, text "${textOf(a)}", log ${replayed}`)
+}
+
+{
+  // `catchUp`'s non-`STEPS` branch: the log holds a row that is not a step batch at all — a whole-document
+  // `PUT`, or a restore — so the only way forward is a rebuild. Nothing else in this file reaches it, which
+  // made it the largest unexercised path in the client.
+  const server = new Sequencer()
+  const hub = new Hub(server)
+  const a = clientScript(hub, server, 'a')
+  hub.join('a', a.client)
+  await settle()
+  typeText(a, 'ab')
+  await settle()
+  await drain(hub)
+  await settle()
+
+  const saved = {
+    type: 'doc',
+    content: [{ type: 'paragraph', content: [{ type: 'text', text: 'wholesale' }] }]
+  }
+  const savedVersion = server.saveWholeDoc('writer-b', saved)
+  const peerStep = {
+    stepType: 'replace', from: 1, to: 1,
+    slice: { content: [{ type: 'text', text: 'Z' }], size: 1, openStart: 0, openEnd: 0 }
+  }
+  const peerVersion = server.commitUnappliable([peerStep], 'peer')
+  // The peer's step is what makes this client look at the log at all; the whole-document row is what it finds.
+  hub.deliverTo('a', { type: 'STEPS', clientId: 'peer', version: peerVersion, steps: [peerStep] })
+  await settle()
+  check('a whole-document write above us is answered by one rebuild, not a loop',
+    textOf(a) === 'Zwholesale' && a.client.version === server.version && a.client.version === savedVersion + 1
+      && !a.client.halted && !a.client.hasUnacked,
+    `"${textOf(a)}", v${a.client.version} of ${server.version}, halted ${a.client.halted}, `
+      + `unacked ${a.client.hasUnacked}, refetches ${a.stats.rebuilds}`)
+}
+
+{
+  // The `ACK.checkpointRequested` path: the server asks on every `CHECKPOINT_EVERY`th version and the upload
+  // folds the log below it. Crossing 200 is the point — every other scenario stops far short of it, so the
+  // only fold exercised until now was the one a test triggered by hand through `requestCheckpoint()`, never
+  // the one the server actually asks for.
+  const server = new Sequencer()
+  const hub = new Hub(server)
+  const a = clientScript(hub, server, 'a')
+  hub.join('a', a.client)
+  await settle()
+  const random = randomFor(97)
+  for (let guard = 0; guard < 400 && server.version <= CHECKPOINTS_EVERY + 3; guard += 1) {
+    if (localEdit(a.editor, a.client, random, { deletes: false })) {
+      await settle()
+      await drain(hub)
+      await settle()
+    }
+  }
+  const foldedAt = server.checkpointVersion
+  const rowsLeft = server.log.length
+  const before = jsonOf(a)
+  const late = clientScript(hub, server, 'late')
+  hub.join('late', late.client)
+  await settle()
+  check('a checkpoint the ACK asked for folds the log and still rebuilds a joiner',
+    foldedAt === CHECKPOINTS_EVERY && rowsLeft < server.version - CHECKPOINTS_EVERY + 1
+      && jsonOf(late) === before && late.client.version === server.version
+      && !a.client.halted && a.stats.rebuilds === 0,
+    `v${server.version}, folded at v${foldedAt}, ${rowsLeft} rows left, joiner matches `
+      + `${jsonOf(late) === before}, refetches ${a.stats.rebuilds}/${late.stats.rebuilds}`)
 }
 
 const failed = results.filter((result) => !result.ok)
