@@ -67,7 +67,7 @@ server contract, and asserts convergence over seven random configurations (~345 
 the scripted orderings that used to be bugs. Its oracle is not "the tabs agree with each other" but "each tab
 equals an independent replay of the operation log", and a run only counts as converged when it needed **no**
 whole-document refetch — otherwise the recovery path passed and the protocol did not. Nothing runs it
-automatically. Exit 0 means 13 checks green; it also prints four KNOWN scenarios, listed below, that are
+automatically. Exit 0 means 14 checks green; it also prints four KNOWN scenarios, listed below, that are
 recorded rather than fixed.
 
 Prerequisite: MySQL on `localhost:3306` with `root` and no password. `application.yml` targets
@@ -126,8 +126,10 @@ command object had nothing to act on. Do not reintroduce them; the reasoning is 
 
 ### Client side (`frontend/src/collab/otClient.js`)
 
-Convergence lives here. At most one batch is outstanding; later local steps fold into the unsent
-batch through a `Mapping`. Each batch carries `inDocument`: incoming steps are mapped only over batches
+Convergence lives here. At most one batch is outstanding; later local steps **append unchanged** to the unsent
+batch — they are already successive, because ProseMirror applied them on top of it, and re-mapping them through
+the batch's own accumulated `Mapping` shifts them twice and stores a history that no longer replays (that was
+the defect behind the folded-batch entry below). Each batch carries `inDocument`: incoming steps are mapped only over batches
 whose steps really are in this document, while *all* pending batches (including the ones parked for a
 replay) are mapped over the incoming ones so they stay sendable — mapping incoming steps over parked ones
 would push them past text that is not there yet, and that asymmetry is the point of `bootstrapNow`'s
@@ -156,16 +158,18 @@ version agreed and the content did not. Upstream added `ReplaceStep.MAP_BIAS` fo
 `from == to`; that flag cannot be used here because it is process-global and would flip the ours-over-theirs
 direction too, which must stay "after".
 
-Four KNOWN scenarios, in two families, both reproduced by `npm run check:collab` and neither fixed:
+Four KNOWN scenarios, reproduced by `npm run check:collab`, none of them fixed — in two families:
 
-1. **A folded batch can corrupt the history.** When several local edits are typed before the wire gets a turn,
-   `addLocalSteps` folds them into one unsent batch, and the submitted steps can include one that no longer
-   applies to the document the server sequences it against — the replay then fails with
-   `Invalid content for node doc: <paragraph("gn"), "p">`, i.e. inline content pushed out of its textblock. That
-   makes the operation log itself unreplayable, which is the same terminal condition this file documents for a
-   deliberately poisoned row — except produced by an honest client, and it needs no attacker. It only appears
-   with deletes in the workload and `burst >= 3` (widest batch 3 / 5); every configuration where each batch holds
-   one step converges. The suspect is the fold's own mapping in `addLocalSteps`, not `integrate()`.
+1. **A concurrent multi-step batch can corrupt the history.** Several clients typing in bursts produce batches
+   of three to five steps, and the submitted steps can then include one that does not apply to the document the
+   server sequenced it against — the replay fails with `Invalid content for node doc`, i.e. inline content
+   pushed out of its textblock. That breaks the operation log itself, the same terminal condition this file
+   documents for a deliberately poisoned row, except produced by honest clients with no attacker involved. A
+   single writer bursting six edits is now clean, which localises it: the fold in `addLocalSteps` was the first
+   offender (it re-mapped already-successive steps and is fixed), and what remains is `integrate()`'s
+   ours-over-theirs re-mapping, which applies one static incoming `Mapping` to a chain whose members are
+   successive relative to each other. Every configuration with one step per batch converges, and so does every
+   single-writer one.
 2. **Our unacknowledged insert is lost across a reconnect.** With our insert in the document and unacknowledged,
    a peer's delete (or mark) at that position leaves this tab matching the log — but the log never received the
    character, and the replay after the reconnect throws `RangeError: Position 8 out of range`. The tab's document

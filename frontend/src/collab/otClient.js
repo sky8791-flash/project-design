@@ -47,8 +47,8 @@ const incomingMapping = (step, unackedMaps) =>
  * - local steps join `pending` **synchronously** (ProseMirror has already applied them); only the send is
  *   serialized onto the promise chain, otherwise steps typed during an awaited fetch would be invisible to
  *   `integrate()` and incoming steps would land at the wrong offsets;
- * - at most one batch is outstanding, so acknowledgement bookkeeping stays trivial; later local steps fold
- *   into the unsent batch after mapping through its accumulated `Mapping`;
+ * - at most one batch is outstanding, so acknowledgement bookkeeping stays trivial; later local steps append to
+ *   the unsent batch unchanged, because ProseMirror already applied them on top of it;
  * - frames are processed through one serialized chain because the server fans frames out after commit, so
  *   two writers' frames can arrive out of order; a version gap is closed by refetching
  *   `GET /{id}/operations?after=`;
@@ -171,8 +171,11 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
 
     const last = pending[pending.length - 1]
     if (last && !last.sent && last.inDocument && last.base === version) {
-      const mapping = new Mapping(last.steps.map((step) => step.getMap()))
-      last.steps = last.steps.concat(steps.map((step) => step.map(mapping)).filter(Boolean))
+      // Append, do not re-map. The caller's steps are already successive — ProseMirror applied them to a
+      // document that contains every step before them — so mapping the new step through the accumulated maps
+      // of the steps it follows shifts it twice and stores a batch that no longer replays. That is not a
+      // cosmetic problem: the batch that goes out is what every other reader replays.
+      last.steps = last.steps.concat(steps)
     } else {
       pending.push({ base: version, steps: [...steps], sent: false, inDocument: true })
     }

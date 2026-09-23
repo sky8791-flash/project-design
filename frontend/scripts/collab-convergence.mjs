@@ -532,10 +532,12 @@ await assertConverged('random: three writers, frames delivered last-first', () =
   }))
 await assertConverged('random: four writers, insert plus mark plus delete workload', () =>
   runRandomRounds({ seed: RANDOM_SEED + 4, writers: 4, rounds: 40, options: { deletes: true } }))
-// Whether `integrate()` handles a batch of several steps is only answered if these runs really produce
-// multi-step rows — the widest batch is printed beside the result for exactly that reason. Flagged as failing:
-// a burst makes a client submit a step that cannot be applied to the document the server sequenced it against,
-// which breaks the history for every reader, and the cause is not yet fixed.
+// One writer, so `integrate()` never runs: whatever this configuration breaks on belongs to the fold in
+// `addLocalSteps` and to no one else.
+await assertConverged('random: one writer, six edits per round (the fold alone, no peer)', () =>
+  runRandomRounds({ seed: RANDOM_SEED + 7, writers: 1, rounds: 60, burst: 6, options: { deletes: true } }))
+// Multi-step batches, flagged as failing: a burst makes a client submit a step that cannot be applied to the
+// document the server sequenced it against, which breaks the history for every reader. The cause is not fixed.
 await assertConverged('random: three writers, three edits per round (multi-step batches)', () =>
   runRandomRounds({ seed: RANDOM_SEED + 5, writers: 3, rounds: 40, burst: 3, options: { deletes: true } }), true)
 await assertConverged('random: two writers, five edits per round, frames reversed (multi-step batches)', () =>
