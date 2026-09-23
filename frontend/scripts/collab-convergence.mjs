@@ -377,7 +377,14 @@ const replayLog = (server) => {
     if (row.commandType !== 'STEPS') continue
     const params = JSON.parse(row.commandParams)
     const tr = state.tr
-    for (const json of params.steps || []) tr.step(Step.fromJSON(schema, json))
+    try {
+      for (const json of params.steps || []) tr.step(Step.fromJSON(schema, json))
+    } catch (error) {
+      // A row that does not apply to the document the server sequenced it against means the history itself is
+      // broken, so no client can be compared to it. Honest clients reach this by submitting a badly mapped
+      // batch, which is a far worse failure than a tab that merely looks wrong.
+      return `BROKEN at v${row.version}: ${error.message}`
+    }
     state = state.apply(tr)
   }
   return canonical(state.doc)
@@ -409,7 +416,7 @@ const RANDOM_SEED = 1000
  * there (insert-only, because a delete legitimately removes somebody else's), the same version as the
  * sequencer, and no batch left unacknowledged.
  */
-const runRandomRounds = async ({ seed, writers, rounds, reorder = (frames) => frames, options }) => {
+const runRandomRounds = async ({ seed, writers, rounds, reorder = (frames) => frames, options, burst = 1 }) => {
   const server = new Sequencer()
   const hub = new Hub(server)
   const random = randomFor(seed)
@@ -424,8 +431,12 @@ const runRandomRounds = async ({ seed, writers, rounds, reorder = (frames) => fr
   const inserted = []
   for (let round = 0; round < rounds; round += 1) {
     for (const side of sides) {
-      const edit = localEdit(side.editor, side.client, random, options)
-      if (edit?.inserted) inserted.push(edit.inserted)
+      // Typing several times before the wire gets a turn is what produces a multi-step batch: `addLocalSteps`
+      // folds each new edit into the last unsent one, so the frame that goes out carries them all.
+      for (let typed = 0; typed < burst; typed += 1) {
+        const edit = localEdit(side.editor, side.client, random, options)
+        if (edit?.inserted) inserted.push(edit.inserted)
+      }
     }
     await settle()
     hub.outbox = reorder(hub.outbox)
@@ -450,6 +461,8 @@ const runRandomRounds = async ({ seed, writers, rounds, reorder = (frames) => fr
     converged: allEqual(sides, jsonOf),
     offLog: sides.filter((side) => jsonOf(side) !== truth),
     rebuilds: sides.reduce((total, side) => total + side.stats.rebuilds, 0),
+    widestBatch: Math.max(0, ...server.log.map((row) => (JSON.parse(row.commandParams).steps || []).length)),
+    logReplay: truth,
     versionsMatch: sides.every((side) => side.client.version === server.version),
     queueDrained: sides.every((side) => !side.client.hasUnacked),
     halted: sides.some((side) => side.client.halted),
@@ -472,8 +485,10 @@ const describe = (outcome) => outcome.livelock
   ? 'the clients never stopped sending to each other'
   : `v${outcome.serverVersion} after ${outcome.edits} inserts — lost ${JSON.stringify(outcome.lost)}, `
     + `converged ${outcome.converged}, offTheLog ${outcome.offLog.length}, rebuilds ${outcome.rebuilds}, `
+    + `widest batch ${outcome.widestBatch}, `
     + `versions ${outcome.versionsMatch}, queue ${outcome.queueDrained}, wire ${outcome.quiet}, `
     + `halted ${outcome.halted}`
+    + (outcome.logReplay?.startsWith('BROKEN') ? `\n       ${outcome.logReplay}` : '')
     + (outcome.offLog.length
       ? `\n       off the log: ${outcome.offLog.map((side) => `"${textOf(side)}"`).join(' vs ')}`
       : '')
@@ -517,14 +532,32 @@ await assertConverged('random: three writers, frames delivered last-first', () =
   }))
 await assertConverged('random: four writers, insert plus mark plus delete workload', () =>
   runRandomRounds({ seed: RANDOM_SEED + 4, writers: 4, rounds: 40, options: { deletes: true } }))
+// Whether `integrate()` handles a batch of several steps is only answered if these runs really produce
+// multi-step rows — the widest batch is printed beside the result for exactly that reason. Flagged as failing:
+// a burst makes a client submit a step that cannot be applied to the document the server sequenced it against,
+// which breaks the history for every reader, and the cause is not yet fixed.
+await assertConverged('random: three writers, three edits per round (multi-step batches)', () =>
+  runRandomRounds({ seed: RANDOM_SEED + 5, writers: 3, rounds: 40, burst: 3, options: { deletes: true } }), true)
+await assertConverged('random: two writers, five edits per round, frames reversed (multi-step batches)', () =>
+  runRandomRounds({
+    seed: RANDOM_SEED + 6,
+    writers: 2,
+    rounds: 40,
+    burst: 5,
+    options: { deletes: true },
+    reorder: (frames) => frames.slice().reverse()
+  }), true)
 
 // --- the specific orderings that used to be bugs -----------------------------
 
 /**
- * A peer's step whose range starts exactly where our unacknowledged insert sits. This is what the width gate
- * in `incomingMapping` protects: reversing the association of a range's `from` as well as its `to` makes the
- * incoming step cover our own pending character, so this tab deletes (or marks) what the user just typed while
- * the peer's tab keeps it — and the next checkpoint this tab uploads folds that loss into shared history.
+ * A peer's step whose range starts exactly where our unacknowledged insert sits: a delete of the character
+ * after it, then a mark on the same range. The expected outcome is that both characters survive in both
+ * documents, because the incoming range maps to the far side of our pending insert.
+ *
+ * These two currently fail, and the failure is not in the incoming mapping — the observed chain is our
+ * reconnect replay after the frame arrives (`RangeError: Position 8 out of range`), which drops the pending
+ * insert instead of restoring it. Recorded rather than explained; see `knownDefects` and AGENTS.md.
  */
 const boundaryCase = async (name, foreign, expected) => {  const server = new Sequencer()
   const hub = new Hub(server)
@@ -551,10 +584,11 @@ const boundaryCase = async (name, foreign, expected) => {  const server = new Se
   await settle()
   const passed = unackedBefore && textOf(a) === expected && jsonOf(a) === replayLog(server)
     && !a.client.halted && !a.client.hasUnacked && a.stats.rebuilds === 0
+  const rows = server.log.map((row) => `v${row.version}:${row.commandParams}`).join(' ')
   const detail = `saw "${textOf(a)}", expected "${expected}", unacked before the frame ${unackedBefore}, `
-    + `rebuilds ${a.stats.rebuilds}\n       doc     ${jsonOf(a)}\n       log     ${replayLog(server)}`
+    + `rebuilds ${a.stats.rebuilds}, halted ${a.client.halted}, unacked after ${a.client.hasUnacked}`
+    + `\n       doc     ${jsonOf(a)}\n       log     ${replayLog(server)}\n       rows    ${rows}`
   if (!passed) {
-    // Reported, not explained: the character is gone and the client rebuilt, and why is not established.
     knownDefects.push(name)
     console.log(`KNOWN  ${name} — reproducible, cause not established\n       ${detail}`)
     return
@@ -562,9 +596,9 @@ const boundaryCase = async (name, foreign, expected) => {  const server = new Se
   check(name, true, detail)
 }
 
-await boundaryCase('a peer deleting at our pending insert takes their character, not ours',
+await boundaryCase('our pending insert survives a peer delete at its position',
   new ReplaceStep(4, 5, Slice.empty), 'abcX')
-await boundaryCase('a peer marking at our pending insert marks their character, not ours',
+await boundaryCase('our pending insert survives a peer mark at its position',
   new AddMarkStep(4, 5, schema.marks.bold.create()), 'abcXd')
 
 {
