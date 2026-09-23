@@ -377,8 +377,17 @@ tabs as two different users (share it `READ_WRITE` first). Things worth watching
   in flight; a stale-base batch was delivered, came back `REJECT`ed, was rebased and committed; text typed
   while the socket was down was parked by the reconnect bootstrap and revived exactly once; and remounting the
   editor rebuilt the identical text from `operation_log`. Still untested: a second real editor peer, so nobody
-  has watched two ProseMirror views land on the same positions; and `bootstrapNow`'s `folded` band needs 200
-  committed versions to reach, so it has never executed.
+  has watched two ProseMirror views land on the same positions.
+- The retention loop end to end, because `bootstrapNow`'s `folded` band only exists past `CHECKPOINT_EVERY`:
+  fill a document to v199 with a scripted writer, open it in the tab (it replays 199 rows), type one char so
+  the *client's own* ack carries `checkpointRequested` and it uploads the checkpoint. Then swallow one ack —
+  wrap the live socket's `onmessage` after capturing the instance from a patched `send`, and drop the first
+  `ACK` — so the client holds a committed-but-unacknowledged batch, `POST /{id}/checkpoint` at the current
+  version to fold the rows away, and close the socket to make the same client bootstrap on reconnect. Expected
+  and observed 2026-09-23: `checkpointVersion` 202, `0` rows left, text unchanged at 205 chars with the
+  swallowed batch's text present exactly **once** and no error — the batch is recognised as folded rather than
+  re-applied. (Not mutation-checked: the counterfactual — dropping the `folded` test and seeing that text
+  duplicated — has not been run, because reaching this state costs 200 commits.)
 - `SELECT document_id, version, COUNT(*) FROM operation_log GROUP BY 1,2 HAVING COUNT(*) > 1` → empty,
   same for `document_snapshot`.
 - Restarting the backend keeps history (`GET /{id}/history`), and restoring a version makes `version`
