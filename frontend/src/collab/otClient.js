@@ -66,7 +66,10 @@ export function createCollabClient({ editor, documentId, clientId, api, ws }) {
   const applySteps = (steps) => {
     if (!steps.length) return
     const tr = editor.state.tr
-    steps.forEach((step) => tr.addStep(step))
+    // `step`, not `addStep`: in this ProseMirror version `addStep(step, doc)` is the internal half that
+    // stores the document the *caller* computed, so calling it with one argument sets the transaction's doc
+    // to undefined and the very next thing ProseMirror does is resolve the selection against it.
+    steps.forEach((step) => tr.step(step))
     tr.setMeta('addToHistory', false)
     tr.setMeta('remote', true)
     editor.view.dispatch(tr)

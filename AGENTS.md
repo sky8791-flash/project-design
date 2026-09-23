@@ -267,30 +267,43 @@ the socket handshake refuses a missing/garbage/disabled token. Add to it rather 
 
 Remaining known holes: no rate limiting or lockout on `/api/users/login`, and there is no CSRF concern
 only because the API is token-in-header and fully JSON — do not add cookie/session auth without revisiting
-that. **One open P0 defect**: an out-of-order pair of frames — the remote `STEPS` for a concurrent write
-arriving *before* our own `ACK` — wedges the tab. Reproduced in a real browser by holding the outbound
-`STEP_BATCH` (patch `WebSocket.prototype.send` in the page) while a second client commits: the local text
-disappears, the status line reads `Cannot read properties of undefined (reading 'resolve')`, thrown from
-`applySteps` via `view.dispatch`, and the local batch never lands. What is ruled out: it is not a
-hand-written step shape (the payload was copied from a genuine client batch), and it is not replaying our
-own row in `catchUp` (that double-application was fixed — `catchUp` now stops at `throughVersion` — and
-the crash survives). What the message actually means: ProseMirror's `Transaction.addStep` assigns
-`this.doc = result.doc`, which is `undefined` when `step.apply(doc)` fails, and the very next thing it does
-is map the selection against that `undefined` doc — so the `TypeError` is a *mask* over "this step does not
-apply to this document". The lead to chase is therefore which step `integrate()` produced (or re-mapped
-twice) for a document that no longer has those offsets, not the selection code. Reproduce in the browser
-(the simplified Node harness with a minimal schema is not trustworthy: it throws on a plain local apply).
+that.
 
-Ruled out since, by reading rather than by test: incoming steps mapped through a batch the server had
-*already committed*. `sendBatch` fixes such a batch's version at `base + 1`, because the row-locked CAS only
-accepts `baseVersion == current`, so a remote frame can only reach `integrate()` with it still in `pending`
-at `version + 1` — which means it branched from the same base and the mapping is required; anything above
-that trips the gap check first, and `catchUp` walks our own log row and calls `dropAcknowledgedOutstanding()`
-before the frame is applied. That also reframes the repro: patching `WebSocket.prototype.send` leaves
-`outstanding` pointing at a batch the server never saw (`sent` only means "handed to the transport"), so no
-`REJECT` will ever arrive to rebase it. Remaining suspects are what `mapThrough` *silently drops* (a step
-whose `map()` returns null disappears from `pending`) and whether the held batch's steps are being applied a
-second time by the local undo history rather than by the protocol.
+**The step-application defect (found and fixed 2026-09-23, after many rounds of being misattributed).**
+`applySteps` built its transaction with `tr.addStep(step)`. In the installed ProseMirror that method is
+`@internal` and its **second parameter is the resulting document** —
+`Transform.addStep(step, doc) { this.docs.push(this.doc); this.steps.push(step); this.mapping.appendMap(step.getMap()); this.doc = doc }`
+— so called with one argument every transaction it produced carried `doc = undefined`, and the next thing
+ProseMirror does is resolve the selection against `tr.doc`. Hence `Cannot read properties of undefined
+(reading 'resolve')`. Consequence, and it is much worse than a wedge: **no remote step ever reached the
+document**, so joining or reloading any document whose text lives only in `operation_log` rendered *empty*,
+and the crash the earlier reports blamed on out-of-order frames was this same line failing inside `catchUp`.
+The fix is `tr.step(step)` — the public wrapper that applies the step and passes `result.doc` to `addStep`.
+The public API to remember: `tr.step` (throws `TransformError` if the step does not apply), `tr.maybeStep`
+(skips it), `tr.addStep` (never — the caller would have to compute the document itself).
+
+**Exercising these paths without a second browser tab** (the agent browser blocks popups; two real tabs as
+two users, per *Verifying changes* below, remains the better test): log in, open `/#/doc/{id}`, and drive the
+editor from `evaluate_script` — focus it,
+set a caret range, then `document.execCommand('insertText', false, 'x')`; a synthetic `beforeinput` is
+ignored. The token is under the `collab-token` localStorage key, and `POST /api/users/register` requires
+`email` (without it the endpoint answers 500, not 400). Then commit from a second *real* client: a Node
+`WebSocket` at `ws://localhost:8080/ws/document/{id}?token=…` sending
+`{type:'STEP_BATCH', clientId, baseVersion: <the version from INIT>, docSize, steps:[{stepType:'replace',
+from, to, slice:{content:[{type:'text',text:'x'}]}}]}`. The server sequences whatever step JSON it is handed,
+so one browser plus one scripted writer is a genuine two-writer test. The oracle is the reload: what the tab
+shows before `location.reload()` must equal what it shows after, because the reload rebuilds only from the
+checkpoint plus `GET /{id}/operations?after=`. It proves the replay agrees with this client's live view; it
+does **not** prove two clients agree, and it cannot see content this client dropped on the floor and then
+laundered into the log by uploading a checkpoint.
+
+Two cautions learned the hard way. Patching `WebSocket.prototype.send` to hold a batch leaves `outstanding`
+pointing at a batch the server never saw — `sent` only means "handed to the transport" — so no `REJECT` will
+ever rebase it and the held text legitimately disappears on the next replay; that is the harness, not the
+protocol. And the repeated failure was never a corrupted editor: `view.dispatch` throws inside
+`state.apply`, before any state is stored, so each arriving frame rebuilt its own broken transaction from a
+clean state. The same `TypeError` in a log therefore means "every remote application path is failing", not
+"one bad frame poisoned something" — read it as a property of `applySteps`, not of the frame that triggered it.
 
 ## REST surface
 
@@ -352,9 +365,12 @@ tabs as two different users (share it `READ_WRITE` first). Things worth watching
   (DevTools → the socket's Messages tab, filter on `STEPS`).
 - `USER_LEFT` arrives **with** `onlineCount` and the number goes down when a tab closes.
 - Typing in both tabs simultaneously: one batch is acked, the other receives `REJECT`, and both tabs
-  converge on the same text with no caret jumps. **This one currently fails** — see the open P0 defect
-  above; do not mark a change to `otClient.js` verified until this passes with the frames delivered in
-  both orders.
+  converge on the same text with no caret jumps. Partly verified 2026-09-23, after the `addStep` fix: with
+  one browser tab plus one scripted `STEP_BATCH` writer, the tab applied the remote frame live and its text
+  equalled the text a reload rebuilt from `operation_log` at the same version. **The `REJECT` leg on the
+  browser side is still unverified** — that needs two writers racing the same base, which the scripted
+  writer has not been made to do yet. Do not mark a change to `otClient.js` verified until it passes with
+  the frames delivered in both orders.
 - `SELECT document_id, version, COUNT(*) FROM operation_log GROUP BY 1,2 HAVING COUNT(*) > 1` → empty,
   same for `document_snapshot`.
 - Restarting the backend keeps history (`GET /{id}/history`), and restoring a version makes `version`
