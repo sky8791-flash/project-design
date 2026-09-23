@@ -386,8 +386,10 @@ tabs as two different users (share it `READ_WRITE` first). Things worth watching
   version to fold the rows away, and close the socket to make the same client bootstrap on reconnect. Expected
   and observed 2026-09-23: `checkpointVersion` 202, `0` rows left, text unchanged at 205 chars with the
   swallowed batch's text present exactly **once** and no error — the batch is recognised as folded rather than
-  re-applied. (Not mutation-checked: the counterfactual — dropping the `folded` test and seeing that text
-  duplicated — has not been run, because reaching this state costs 200 commits.)
+  re-applied. Mutation-checked: with `folded` neutralised and everything else identical, the reconnect on a
+  second document re-applied the batch (`…QZZ`, one character longer than the server's content) **and resent
+  it**, so the server advanced 201 → 202 and a duplicate row was appended. The duplicate is not a local
+  rendering glitch — it enters the shared history, which is what makes this guard worth its complexity.
 - `SELECT document_id, version, COUNT(*) FROM operation_log GROUP BY 1,2 HAVING COUNT(*) > 1` → empty,
   same for `document_snapshot`.
 - Restarting the backend keeps history (`GET /{id}/history`), and restoring a version makes `version`
